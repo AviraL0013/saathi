@@ -137,7 +137,7 @@ class Settings(BaseSettings):
     twilio_account_sid: str = Field(default="", alias="TWILIO_ACCOUNT_SID")
     twilio_auth_token: str = Field(default="", alias="TWILIO_AUTH_TOKEN")
     twilio_from_whatsapp: str = Field(default="whatsapp:+14155238886", alias="TWILIO_FROM_WHATSAPP")
-    twilio_from_sms: str = Field(default="", alias="TWILIO_FROM_SMS")
+    twilio_from_sms: str = Field(default="+18777804236", alias="TWILIO_FROM_SMS")
     member_phone_map_json: str = Field(default="{}", alias="MEMBER_PHONE_MAP")
 
     @property

@@ -413,9 +413,9 @@ class BedrockLayer:
                     },
                     {
                         "action_type": "notification",
-                        "target_member_ids": ["mbr_mama_004"],
-                        "message": "Mehmaan aa rahe hain — ghar taiyar karen",
-                        "channel": "alexa_voice",
+                        "target_member_ids": ["mbr_papa_003"],
+                        "message": "Mehmaan aa rahe hain - ghar taiyar karen",
+                        "channel": "whatsapp",
                         "source": "BEDROCK",
                     },
                 ],
