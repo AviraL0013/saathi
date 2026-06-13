@@ -1,0 +1,69 @@
+"use client";
+
+import type { FamilyPresence as FP } from "@/services/dashboard.service";
+
+const ageColor: Record<string, string> = {
+  senior: "#8b5cf6",
+  adult:  "#374151",
+  teen:   "#0ea5e9",
+  child:  "#10b981",
+};
+
+export function FamilyPresence({ presence }: { presence: FP }) {
+  return (
+    <div className="bg-white border border-[#e5e7eb] rounded-2xl overflow-hidden">
+      <div className="px-5 py-3.5 border-b border-[#f3f4f6]">
+        <p className="font-mono text-[10px] tracking-[0.18em] uppercase text-[#9ca3af] font-semibold">Family presence</p>
+      </div>
+
+      {/* Home */}
+      {presence.home.length > 0 && (
+        <div className="px-5 py-3 border-b border-[#f9f9f9]">
+          <p className="font-mono text-[9px] tracking-[0.15em] uppercase text-[#10b981] mb-2">Home · {presence.home.length}</p>
+          <div className="flex flex-col gap-2">
+            {presence.home.map((m) => {
+              const activity = presence.currentActivity.find((a) => a.memberId === m.id);
+              return (
+                <div key={m.id} className="flex items-center gap-2.5">
+                  <div
+                    className="w-6 h-6 rounded-full border flex items-center justify-center text-[11px] font-bold shrink-0"
+                    style={{ color: ageColor[m.ageGroup], borderColor: `${ageColor[m.ageGroup]}30`, backgroundColor: `${ageColor[m.ageGroup]}08` }}
+                  >
+                    {m.name[0]}
+                  </div>
+                  <div className="min-w-0">
+                    <span className="text-[13px] font-semibold text-[#111827]">{m.name}</span>
+                    {activity && (
+                      <p className="text-[11px] text-[#9ca3af] truncate">{activity.activity}</p>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {/* Away */}
+      {presence.away.length > 0 && (
+        <div className="px-5 py-3">
+          <p className="font-mono text-[9px] tracking-[0.15em] uppercase text-[#9ca3af] mb-2">Away · {presence.away.length}</p>
+          <div className="flex flex-col gap-2">
+            {presence.away.map((m) => (
+              <div key={m.id} className="flex items-center gap-2.5 opacity-60">
+                <div
+                  className="w-6 h-6 rounded-full border flex items-center justify-center text-[11px] font-bold shrink-0"
+                  style={{ color: ageColor[m.ageGroup], borderColor: `${ageColor[m.ageGroup]}30`, backgroundColor: `${ageColor[m.ageGroup]}08` }}
+                >
+                  {m.name[0]}
+                </div>
+                <span className="text-[13px] font-semibold text-[#6b7280]">{m.name}</span>
+                <span className="text-[11px] text-[#9ca3af] ml-auto capitalize">{m.ageGroup}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
