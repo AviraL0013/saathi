@@ -32,15 +32,25 @@ logger = logging.getLogger(__name__)
 
 class ContextBuilder:
     """
-    Converts a batch of NormalizedEvents + HouseholdContext + graph subgraph
-    into a token-efficient BedrockContext.
+    Converts a batch of NormalizedEvents + HouseholdContext into a
+    token-efficient BedrockContext.
 
-    Token budget target: 1,100–1,500 tokens.
-    Achieved by:
-      - Only including graph nodes relevant to the event's device + affected members
-      - Trimming device_states to 10 most recent
-      - Capping life_events and rte_summary to 5 entries each
+    Token budget target: <400 tokens.
+    Strategy:
+      - Events: only event_type + device_type + the 3 most relevant payload keys
+      - Device states: capped at 3 entries, only (state, device_type) fields
+      - Members presence: only member_id + is_home (drop room_id, detected_at)
+      - Life events: capped at 3, only (event_id, event_type, remaining_days)
+      - Graph subgraph: always excluded (too expensive, not used by prompt)
+      - No None values, no empty collections
+      - Serialised with no indentation
     """
+
+    # Payload keys that are actually useful for reasoning — everything else is dropped
+    _PAYLOAD_KEEP = {"tank_level_percent", "whistle_count", "running_minutes",
+                     "door_open_seconds", "temperature_c", "volume_percent",
+                     "state", "event", "member_id", "remaining_days",
+                     "guest_count", "relation", "festival"}
 
     def build_bedrock_context(
         self,
@@ -49,54 +59,68 @@ class ContextBuilder:
         graph_subgraph: dict[str, Any] | None = None,
         rule_engine_already_handled: list[str] | None = None,
     ) -> BedrockContext:
-        now_ist = datetime.now(tz=timezone.utc).isoformat()
 
-        # Summarise events (only key fields for token efficiency)
-        events_summary = [
-            {
-                "event_id":   ev.event_id,
+        # ── Events: drop event_id, clip payload to relevant keys ─────
+        events_summary = []
+        for ev in batch:
+            entry: dict[str, Any] = {
                 "event_type": ev.event_type.value,
-                "device_type": ev.device_type.value if ev.device_type else None,
-                "device_id":  ev.device_id,
-                "payload":    ev.payload,
-                "impact":     ev.impact_level.value if ev.impact_level else None,
             }
-            for ev in batch
+            if ev.device_type:
+                entry["device_type"] = ev.device_type.value
+            if ev.impact_level:
+                entry["impact"] = ev.impact_level.value
+            trimmed_payload = {
+                k: v for k, v in ev.payload.items()
+                if k in self._PAYLOAD_KEEP and v is not None
+            }
+            if trimmed_payload:
+                entry["payload"] = trimmed_payload
+            events_summary.append(entry)
+
+        # ── Device states: cap 3, only state + device_type ───────────
+        device_states: dict[str, Any] = {}
+        for dev_id, state_dict in list(context.device_states.items())[:3]:
+            slim = {k: v for k, v in state_dict.items()
+                    if k in ("state", "device_type") and v is not None}
+            if slim:
+                device_states[dev_id] = slim
+
+        # ── Time context ─────────────────────────────────────────────
+        time_context: dict[str, str] = {}
+        if context.ist_time:
+            time_context["time"] = context.ist_time
+        if context.time_of_day:
+            time_context["period"] = context.time_of_day
+        if context.day_of_week:
+            time_context["day"] = context.day_of_week
+
+        # ── Presence: only member_id + is_home ───────────────────────
+        presence_summary = [
+            {"member_id": mp.member_id, "home": mp.is_home}
+            for mp in context.members_presence
         ]
 
-        # Cap device states to 10 entries
-        device_states = dict(list(context.device_states.items())[:10])
-
-        # Time context
-        time_context = {
-            "ist_time":    context.ist_time or now_ist,
-            "time_of_day": context.time_of_day or "unknown",
-            "day_of_week": context.day_of_week or "unknown",
-        }
-
-        # Member presence summary
-        presence_summary = [
-            {
-                "member_id": mp.member_id,
-                "room_id":   mp.room_id,
-                "is_home":   mp.is_home,
-            }
-            for mp in context.members_presence
+        # ── Life events: cap 3, only actionable fields ───────────────
+        life_events_slim = [
+            {k: v for k, v in le.items()
+             if k in ("event_id", "event_type", "remaining_days", "constraints") and v is not None}
+            for le in context.active_life_events[:3]
         ]
 
         ctx = BedrockContext(
             household_id=context.household_id,
             events=events_summary,
-            graph_subgraph=graph_subgraph or {},
-            active_life_events=context.active_life_events[:5],
+            graph_subgraph={},                              # always excluded
+            active_life_events=life_events_slim,
             members_presence=presence_summary,
             device_states=device_states,
             rule_engine_already_handled=rule_engine_already_handled or [],
             time_context=time_context,
         )
 
-        # Rough token estimate: 1 token ≈ 4 characters of JSON
-        raw = json.dumps(ctx.model_dump(), default=str)
+        # Token estimate: 1 token ≈ 4 chars, no indent serialisation
+        raw = json.dumps(ctx.model_dump(), default=str, separators=(",", ":"))
         ctx.estimated_tokens = len(raw) // 4
 
         logger.debug(
@@ -211,6 +235,49 @@ class BedrockCircuitBreaker:
 
 
 # ─────────────────────────────────────────────────────────────
+# Module-level helpers
+# ─────────────────────────────────────────────────────────────
+
+def _normalise_suggested_patterns(raw: Any) -> list[dict]:
+    """
+    C. Normalise whatever the model returns for suggested_patterns into
+    list[dict[str, Any]] so BedrockResponse never sees invalid types.
+
+    Handles:
+      - list[dict]  → returned as-is (already correct)
+      - list[str]   → each string becomes {"pattern_id": s, "description": s,
+                                            "confidence": 0.0, "event_type": None}
+      - None / non-list → empty list
+      - mixed list  → each element normalised individually
+    """
+    if not isinstance(raw, list):
+        return []
+
+    result: list[dict] = []
+    for item in raw:
+        if isinstance(item, dict):
+            result.append(item)
+        elif isinstance(item, str):
+            # Model returned a bare string like "evening_reception" — promote it
+            logger.warning(
+                f"BedrockLayer: suggested_patterns contained a string {item!r}; "
+                "promoting to minimal dict. Consider improving the prompt."
+            )
+            result.append({
+                "pattern_id":  item,
+                "description": item,
+                "confidence":  0.0,
+                "event_type":  None,
+            })
+        else:
+            logger.warning(
+                f"BedrockLayer: skipping unexpected suggested_pattern type "
+                f"{type(item).__name__}: {item!r}"
+            )
+    return result
+
+
+# ─────────────────────────────────────────────────────────────
 # 9.6  BedrockLayer
 # ─────────────────────────────────────────────────────────────
 
@@ -227,9 +294,17 @@ class BedrockLayer:
     event type so the full pipeline can be tested without AWS credentials.
     """
 
-    _MOCK_PROMPT = (
-        "You are SAATHI, an intelligent home automation assistant for Indian families. "
-        "Respond with a JSON object containing 'actions', 'reasoning', and 'suggested_patterns'."
+    # ── System prompt sent to Bedrock ──────────────────────────────────────────
+    # Kept deliberately minimal to save output tokens.
+    # The JSON schema in the prompt tells the model exactly what to return so it
+    # doesn't waste tokens on prose, markdown fences, or explanations.
+    _SYSTEM_PROMPT = (
+        "You are SAATHI, a smart home assistant for Indian families. "
+        "Return ONLY valid JSON. No markdown, no code fences, no explanations.\n"
+        "Schema:\n"
+        '{"actions":[{"action_type":"device_command|notification","device_id":"...","command":"...","target_member_ids":[],"message":"...","channel":"alexa_voice|mobile_push|whatsapp"}],'
+        '"reasoning":"one sentence","confidence":0.0,'
+        '"suggested_patterns":[{"pattern_id":"...","description":"...","confidence":0.0,"event_type":"..."}]}'
     )
 
     def __init__(
@@ -413,41 +488,102 @@ class BedrockLayer:
         ctx: BedrockContext,
         household_id: str,
     ) -> BedrockResponse:
-        """Real AWS Bedrock converse API call."""
+        """
+        Real AWS Bedrock converse API call.
+
+        Hardening applied here (not in the schema) so BedrockResponse always
+        receives clean data and never raises a Pydantic validation error:
+
+          A. Log the raw model output before any parsing.
+          B. Strip markdown code fences the model sometimes emits.
+          C. Normalise suggested_patterns: accept list[str] or list[dict];
+             strings are promoted to minimal dicts so Pydantic is happy.
+          D. Defensive fallback: if JSON parsing fails entirely, return
+             actions=[], patterns=[], and keep the raw text as reasoning.
+        """
         import boto3
 
-        client = boto3.client("bedrock-runtime", region_name=settings.aws_region)
-
-        prompt_body = (
-            f"{self._MOCK_PROMPT}\n\n"
-            f"Context:\n{json.dumps(ctx.model_dump(), default=str, indent=2)}\n\n"
-            "Respond with valid JSON only."
+        client = boto3.client(
+            "bedrock-runtime",
+            region_name=settings.aws_region,
+            aws_access_key_id=settings.aws_access_key_id,
+            aws_secret_access_key=settings.aws_secret_access_key,
         )
 
+        # ── Build the prompt ─────────────────────────────────────────
+        # Serialise context without indentation and without None/empty
+        # fields to keep the input token count as low as possible.
+        ctx_dict = {
+            k: v for k, v in ctx.model_dump().items()
+            if v not in (None, [], {}, "")
+        }
+        context_json = json.dumps(ctx_dict, default=str, separators=(",", ":"))
+
+        prompt_body = (
+            f"{self._SYSTEM_PROMPT}\n\n"
+            f"Context: {context_json}"
+        )
+
+        # ── Invoke ───────────────────────────────────────────────────
         response = client.converse(
             modelId=settings.bedrock_model_id,
             messages=[{"role": "user", "content": [{"text": prompt_body}]}],
         )
 
-        output_text = (
-            response["output"]["message"]["content"][0]["text"]
-        )
+        output_text: str = response["output"]["message"]["content"][0]["text"]
         usage = response.get("usage", {})
 
-        try:
-            parsed = json.loads(output_text)
-        except json.JSONDecodeError:
-            parsed = {"actions": [], "reasoning": output_text, "suggested_patterns": []}
+        # A. Log raw output for debugging — always, before any processing
+        logger.info(f"RAW BEDROCK OUTPUT: {output_text}")
+
+        # ── Parse ────────────────────────────────────────────────────
+        parsed = self._parse_model_output(output_text)
+
+        # C. Normalise suggested_patterns
+        raw_patterns = parsed.get("suggested_patterns", [])
+        safe_patterns = _normalise_suggested_patterns(raw_patterns)
 
         return BedrockResponse(
             household_id=household_id,
             actions=parsed.get("actions", []),
             reasoning=parsed.get("reasoning", ""),
-            confidence=parsed.get("confidence", 0.85),
+            confidence=float(parsed.get("confidence", 0.85)),
             input_tokens=usage.get("inputTokens", 0),
             output_tokens=usage.get("outputTokens", 0),
             total_tokens=usage.get("totalTokens", 0),
             estimated_cost_usd=usage.get("totalTokens", 0) * 0.000003,
             model_id=settings.bedrock_model_id,
-            suggested_patterns=parsed.get("suggested_patterns", []),
+            suggested_patterns=safe_patterns,
         )
+
+    # ── Shared parsing helpers ────────────────────────────────
+
+    @staticmethod
+    def _parse_model_output(output_text: str) -> dict:
+        """
+        B + D: Strip markdown fences, attempt JSON parse.
+        On any failure keep the text as reasoning and return safe defaults.
+        """
+        # Strip markdown code fences: ```json ... ``` or ``` ... ```
+        text = output_text.strip()
+        if text.startswith("```"):
+            text = text.split("\n", 1)[-1]          # drop opening fence line
+            text = text.rsplit("```", 1)[0].strip()  # drop closing fence
+
+        try:
+            parsed = json.loads(text)
+            if not isinstance(parsed, dict):
+                raise ValueError(f"Expected dict, got {type(parsed).__name__}")
+            return parsed
+        except (json.JSONDecodeError, ValueError) as exc:
+            logger.warning(
+                f"BedrockLayer: JSON parse failed ({exc}). "
+                f"Raw output length={len(output_text)}. Using safe defaults."
+            )
+            # D. Defensive fallback — never propagate a parse error upward
+            return {
+                "actions": [],
+                "reasoning": output_text[:500],   # cap to avoid huge strings
+                "confidence": 0.0,
+                "suggested_patterns": [],
+            }

@@ -69,7 +69,7 @@ class Settings(BaseSettings):
     # ── Bedrock ───────────────────────────────────────────
     bedrock_mock_mode: bool = Field(default=True, alias="BEDROCK_MOCK_MODE")
     bedrock_model_id: str = Field(
-        default="anthropic.claude-sonnet-4-5",
+        default="apac.amazon.nova-micro-v1:0",
         alias="BEDROCK_MODEL_ID"
     )
 
