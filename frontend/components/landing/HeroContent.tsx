@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { motion, Variants } from "framer-motion";
 import { ArrowRight, Play } from "lucide-react";
 import { Button } from "@/components/ui/Button";
@@ -72,20 +73,24 @@ export function HeroContent() {
         variants={itemVariants}
         className="flex flex-col sm:flex-row gap-3"
       >
-        <Button
-          variant="primary"
-          icon={<ArrowRight size={16} strokeWidth={2.5} />}
-          className="justify-center sm:justify-start"
-        >
-          {HERO.ctaPrimary}
-        </Button>
-        <Button
-          variant="secondary"
-          icon={<Play size={14} strokeWidth={2} fill="currentColor" />}
-          className="justify-center sm:justify-start"
-        >
-          {HERO.ctaSecondary}
-        </Button>
+        <Link href="/onboard">
+          <Button
+            variant="primary"
+            icon={<ArrowRight size={16} strokeWidth={2.5} />}
+            className="justify-center sm:justify-start w-full"
+          >
+            {HERO.ctaPrimary}
+          </Button>
+        </Link>
+        <Link href="/demo/loading">
+          <Button
+            variant="secondary"
+            icon={<Play size={14} strokeWidth={2} fill="currentColor" />}
+            className="justify-center sm:justify-start w-full"
+          >
+            {HERO.ctaSecondary}
+          </Button>
+        </Link>
       </motion.div>
 
       {/* Privacy card — bottom left */}
