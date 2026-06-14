@@ -14,7 +14,7 @@ function buildInsights(state: ReturnType<typeof useOnboardingStore>) {
   // Device-based
   const hasAC = state.devices.some((d) => d.type === "ac");
   const hasWaterMotor = state.devices.some((d) => d.type === "water_motor");
-  const hasTV = state.devices.some((d) => d.type === "television");
+  const hasTV = state.devices.some((d) => d.type === "tv");
   const hasMedicineRoutine = state.routines.some(
     (r) => (r.id === "medicine_morning" || r.id === "medicine_night") && r.selected
   );
