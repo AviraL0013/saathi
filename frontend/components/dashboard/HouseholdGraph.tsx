@@ -1,148 +1,439 @@
 "use client";
 
-import { motion } from "framer-motion";
-import type { HouseholdGraph as HouseholdGraphData } from "@/services/dashboard.service";
+/**
+ * HouseholdGraph — Phase 9
+ *
+ * Interactive force-directed graph built on react-force-graph-2d.
+ * Click any node to zoom into its local neighbourhood.
+ * Escape or click background to reset.
+ *
+ * Node types and colours:
+ *   member          — large, age-coloured ring
+ *   health_condition — red
+ *   medication      — purple
+ *   routine         — green
+ *   device          — blue
+ *   life_event      — gold
+ *
+ * Edge types: HAS_CONDITION, TAKES, FOLLOWS, PRIMARY_USER_OF,
+ *             DIRECTLY_AFFECTS, CONFLICTS_WITH, LOCATED_IN
+ */
 
-const AGE_COLOR: Record<string, string> = {
+import dynamic from "next/dynamic";
+import { useCallback, useEffect, useRef, useState } from "react";
+import type { BackendFullGraphResponse, BackendGraphNode, BackendGraphEdge, HouseholdGraph as HouseholdGraphLegacy } from "@/services/dashboard.service";
+
+// ── dynamic import avoids SSR issues with canvas APIs ──────────────────────
+const ForceGraph2D = dynamic(
+  () => import("react-force-graph-2d"),
+  { ssr: false }
+);
+
+// ─── Colours ───────────────────────────────────────────────────────────────────
+
+const NODE_COLORS: Record<string, string> = {
+  member:           "#111827",
+  health_condition: "#ef4444",
+  medication:       "#8b5cf6",
+  routine:          "#10b981",
+  device:           "#0ea5e9",
+  life_event:       "#f59e0b",
+  household:        "#6b7280",
+  rule:             "#ec4899",
+  pattern:          "#a78bfa",
+};
+
+const AGE_COLORS: Record<string, string> = {
   senior: "#8b5cf6",
   adult:  "#374151",
   teen:   "#0ea5e9",
   child:  "#10b981",
 };
 
-const EDGE_TYPE_COLOR: Record<string, string> = {
-  health:   "#ec4899",
-  routine:  "#8b5cf6",
-  event:    "#f59e0b",
-  device:   "#0ea5e9",
-  behavior: "#6366f1",
+const EDGE_COLORS: Record<string, string> = {
+  HAS_CONDITION:    "#ef4444",
+  TAKES:            "#8b5cf6",
+  FOLLOWS:          "#10b981",
+  PRIMARY_USER_OF:  "#0ea5e9",
+  DIRECTLY_AFFECTS: "#f59e0b",
+  CONFLICTS_WITH:   "#f97316",
+  LOCATED_IN:       "#d1d5db",
 };
 
-export function HouseholdGraph({ graph }: { graph: HouseholdGraphData }) {
-  const { members } = graph;
+const NODE_SIZE: Record<string, number> = {
+  member:           8,
+  health_condition: 4,
+  medication:       4,
+  routine:          3.5,
+  device:           4,
+  life_event:       6,
+  household:        2,
+};
 
-  const W = 380;
-  const H = 420;
-  const cx = W / 2;
-  const cy = H / 2 - 10;
-  const ringR = 130;
-  const nodeR = 26;
+// ─── Types ─────────────────────────────────────────────────────────────────────
 
-  const nodes = members.map((m, i) => {
-    const angle = (i / members.length) * 2 * Math.PI - Math.PI / 2;
-    return { ...m, x: cx + ringR * Math.cos(angle), y: cy + ringR * Math.sin(angle), angle };
-  });
+interface FGNode {
+  id: string;
+  label: string;
+  type: string;
+  role?: string;
+  age?: number;
+  severity?: string;
+  critical?: boolean;
+  time_window?: string;
+  schedule?: string;
+  description?: string;
+  x?: number;
+  y?: number;
+  fx?: number;
+  fy?: number;
+  __visible?: boolean;
+}
 
-  // Pick 4 most interesting nodes for active spokes
-  const highlighted = members
-    .filter((m) => m.connections.some((c) => c.confidence && c.confidence > 0.7))
-    .slice(0, 4)
-    .map((m) => m.id);
+interface FGLink {
+  source: string;
+  target: string;
+  type: string;
+  reason?: string;
+}
+
+interface GraphData {
+  nodes: FGNode[];
+  links: FGLink[];
+}
+
+// ─── Legend ────────────────────────────────────────────────────────────────────
+
+const LEGEND = [
+  { color: "#111827", label: "Member" },
+  { color: "#ef4444", label: "Condition" },
+  { color: "#8b5cf6", label: "Medication" },
+  { color: "#10b981", label: "Routine" },
+  { color: "#0ea5e9", label: "Device" },
+  { color: "#f59e0b", label: "Life event" },
+];
+
+// ─── Build graph data from backend response ─────────────────────────────────
+
+function buildGraphData(
+  fullGraph: BackendFullGraphResponse | null,
+  legacy: HouseholdGraphLegacy,
+): GraphData {
+  if (!fullGraph || fullGraph.nodes.length === 0) {
+    // Fallback: render legacy member ring as flat nodes
+    return {
+      nodes: legacy.members.map((m) => ({
+        id: m.id,
+        label: m.name,
+        type: "member",
+        role: m.role,
+        age: m.age,
+      })),
+      links: [],
+    };
+  }
+
+  // Filter out household meta node and room nodes (no node_type or type "household")
+  const nodes: FGNode[] = fullGraph.nodes
+    .filter((n) => n.node_type && n.node_type !== "household")
+    .map((n): FGNode => ({
+      id: n.id,
+      label: n.name ?? n.condition ?? n.description?.slice(0, 32) ?? n.id.replace(/_/g, " "),
+      type: n.node_type,
+      role: n.role,
+      age: n.age,
+      severity: n.severity,
+      critical: n.critical,
+      time_window: n.time_window,
+      schedule: n.schedule,
+      description: n.description,
+    }));
+
+  // Only keep edges where both endpoints are in our node set
+  const nodeIds = new Set(nodes.map((n) => n.id));
+  const links: FGLink[] = fullGraph.edges
+    .filter((e) => e.type !== "LOCATED_IN") // hide room edges — visual clutter
+    .filter((e) => nodeIds.has(e.from) && nodeIds.has(e.to))
+    .map((e): FGLink => ({
+      source: e.from,
+      target: e.to,
+      type: e.type,
+      reason: e.reason,
+    }));
+
+  return { nodes, links };
+}
+
+// ─── Component ────────────────────────────────────────────────────────────────
+
+interface HouseholdGraphProps {
+  graph: HouseholdGraphLegacy;
+  fullGraph?: BackendFullGraphResponse | null;
+}
+
+export function HouseholdGraph({ graph, fullGraph = null }: HouseholdGraphProps) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const [width, setWidth] = useState(340);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [tooltip, setTooltip] = useState<{ node: FGNode; x: number; y: number } | null>(null);
+
+  const { nodes, links } = buildGraphData(fullGraph, graph);
+
+  // Measure container width
+  useEffect(() => {
+    if (!containerRef.current) return;
+    const ro = new ResizeObserver((entries) => {
+      const w = entries[0]?.contentRect.width;
+      if (w) setWidth(Math.floor(w));
+    });
+    ro.observe(containerRef.current);
+    setWidth(containerRef.current.offsetWidth || 340);
+    return () => ro.disconnect();
+  }, []);
+
+  // Visible nodes: if something selected, show only local neighbourhood
+  const visibleNodes = selectedId
+    ? (() => {
+        const neighbourIds = new Set<string>([selectedId]);
+        for (const l of links) {
+          const src = typeof l.source === "object" ? (l.source as FGNode).id : l.source;
+          const tgt = typeof l.target === "object" ? (l.target as FGNode).id : l.target;
+          if (src === selectedId) neighbourIds.add(tgt);
+          if (tgt === selectedId) neighbourIds.add(src);
+        }
+        return new Set(neighbourIds);
+      })()
+    : null;
+
+  const filteredData: GraphData = {
+    nodes: visibleNodes
+      ? nodes.filter((n) => visibleNodes.has(n.id))
+      : nodes,
+    links: visibleNodes
+      ? links.filter((l) => {
+          const src = typeof l.source === "object" ? (l.source as FGNode).id : l.source;
+          const tgt = typeof l.target === "object" ? (l.target as FGNode).id : l.target;
+          return visibleNodes.has(src) && visibleNodes.has(tgt);
+        })
+      : links,
+  };
+
+  // Custom node painter
+  const paintNode = useCallback((node: FGNode, ctx: CanvasRenderingContext2D, scale: number) => {
+    const r = (NODE_SIZE[node.type] ?? 4);
+    const x = node.x ?? 0;
+    const y = node.y ?? 0;
+    const isSelected = node.id === selectedId;
+    const isMember = node.type === "member";
+
+    // Glow for selected
+    if (isSelected) {
+      ctx.beginPath();
+      ctx.arc(x, y, r + 4, 0, 2 * Math.PI);
+      ctx.fillStyle = "rgba(139, 92, 246, 0.2)";
+      ctx.fill();
+    }
+
+    // Node circle
+    ctx.beginPath();
+    ctx.arc(x, y, r, 0, 2 * Math.PI);
+    const baseColor = isMember
+      ? (node.role === "grandparent" ? AGE_COLORS.senior
+        : node.role === "parent" ? AGE_COLORS.adult
+        : node.age && node.age >= 13 ? AGE_COLORS.teen
+        : AGE_COLORS.child)
+      : (NODE_COLORS[node.type] ?? "#6b7280");
+
+    if (isMember) {
+      ctx.fillStyle = "white";
+      ctx.fill();
+      ctx.strokeStyle = baseColor;
+      ctx.lineWidth = isSelected ? 2.5 : 1.5;
+      ctx.stroke();
+    } else {
+      ctx.fillStyle = baseColor;
+      ctx.globalAlpha = isSelected ? 1 : 0.85;
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+
+    // Critical/severity indicator ring
+    if (node.critical || node.severity === "moderate" || node.severity === "high") {
+      ctx.beginPath();
+      ctx.arc(x, y, r + 2, 0, 2 * Math.PI);
+      ctx.strokeStyle = "#ef4444";
+      ctx.lineWidth = 0.8;
+      ctx.setLineDash([2, 2]);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+
+    // Label (only when scaled up enough or is member)
+    const minScale = isMember ? 0.3 : 1.0;
+    if (scale > minScale) {
+      const label = node.label.length > 18 ? node.label.slice(0, 16) + "…" : node.label;
+      ctx.font = isMember
+        ? `bold ${Math.max(10, 12 / scale)}px system-ui`
+        : `${Math.max(8, 9 / scale)}px ui-monospace, monospace`;
+      ctx.fillStyle = isMember ? baseColor : "#374151";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      if (isMember) {
+        // Initial inside circle
+        ctx.font = `bold ${r * 0.9}px system-ui`;
+        ctx.fillStyle = baseColor;
+        ctx.fillText(node.label[0]?.toUpperCase() ?? "?", x, y);
+        // Name below
+        ctx.font = `bold ${Math.max(9, 10 / scale)}px system-ui`;
+        ctx.fillStyle = "#111827";
+        ctx.fillText(label, x, y + r + 8 / scale);
+        if (node.age) {
+          ctx.font = `${Math.max(7, 8 / scale)}px ui-monospace`;
+          ctx.fillStyle = "#9ca3af";
+          ctx.fillText(String(node.age), x, y + r + 17 / scale);
+        }
+      } else {
+        ctx.fillText(label, x, y + r + 7 / scale);
+      }
+    }
+  }, [selectedId]);
+
+// ─── Link painter
+  const paintLink = useCallback((link: FGLink, ctx: CanvasRenderingContext2D) => {
+    const color = EDGE_COLORS[link.type] ?? "#d1d5db";
+    const src = typeof link.source === "object" ? link.source as FGNode : null;
+    const tgt = typeof link.target === "object" ? link.target as FGNode : null;
+    if (!src?.x || !src?.y || !tgt?.x || !tgt?.y) return;
+
+    ctx.beginPath();
+    ctx.moveTo(src.x, src.y);
+    ctx.lineTo(tgt.x, tgt.y);
+    ctx.strokeStyle = color;
+    ctx.lineWidth = link.type === "CONFLICTS_WITH" ? 1.5 : 0.8;
+    if (link.type === "CONFLICTS_WITH") ctx.setLineDash([3, 3]);
+    else ctx.setLineDash([]);
+    ctx.globalAlpha = 0.7;
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+    ctx.setLineDash([]);
+  }, []);
+
+  const handleNodeClick = useCallback((node: FGNode) => {
+    setSelectedId((prev) => prev === node.id ? null : node.id);
+    setTooltip(null);
+  }, []);
+
+  const handleNodeHover = useCallback((node: FGNode | null) => {
+    if (!node) { setTooltip(null); return; }
+    setTooltip({ node, x: 0, y: 0 });
+  }, []);
+
+  const handleBackgroundClick = useCallback(() => {
+    setSelectedId(null);
+    setTooltip(null);
+  }, []);
+
+  const selectedNode = selectedId ? nodes.find((n) => n.id === selectedId) : null;
 
   return (
-    <div className="w-full" style={{ aspectRatio: `${W}/${H}` }}>
-      <svg viewBox={`0 0 ${W} ${H}`} className="w-full h-full overflow-visible">
+    <div className="w-full flex flex-col gap-0">
+      {/* Graph canvas */}
+      <div ref={containerRef} className="w-full relative" style={{ height: 380, background: "#fafafa", borderRadius: "0 0 0 0" }}>
+        {width > 0 && (
+          <ForceGraph2D
+            graphData={filteredData as { nodes: object[]; links: object[] }}
+            width={width}
+            height={380}
+            backgroundColor="#fafafa"
+            nodeId="id"
+            linkSource="source"
+            linkTarget="target"
+            nodeCanvasObject={paintNode as (node: object, ctx: CanvasRenderingContext2D, scale: number) => void}
+            nodeCanvasObjectMode={() => "replace"}
+            linkCanvasObject={paintLink as (link: object, ctx: CanvasRenderingContext2D) => void}
+            linkCanvasObjectMode={() => "replace"}
+            nodeLabel={() => ""}
+            onNodeClick={handleNodeClick as (node: object) => void}
+            onNodeHover={handleNodeHover as (node: object | null, prevNode: object | null) => void}
+            onBackgroundClick={handleBackgroundClick}
+            cooldownTicks={80}
+            nodeRelSize={4}
+            d3AlphaDecay={0.04}
+            d3VelocityDecay={0.3}
+          />
+        )}
 
-        {/* Guide ring */}
-        <circle cx={cx} cy={cy} r={ringR} fill="none" stroke="#f0eff8" strokeWidth="1" strokeDasharray="3 5" />
+        {/* Click-to-reset hint */}
+        {selectedId && (
+          <button
+            onClick={handleBackgroundClick}
+            className="absolute top-2 right-2 text-[10px] font-mono text-[#9ca3af] bg-white border border-[#e5e7eb] px-2 py-1 rounded-full hover:text-[#374151] transition-colors"
+          >
+            Show all ×
+          </button>
+        )}
 
-        {/* Spokes */}
-        {nodes.map((node) => {
-          const isHighlighted = highlighted.includes(node.id);
-          return (
-            <motion.line
-              key={`spoke-${node.id}`}
-              x1={node.x} y1={node.y} x2={cx} y2={cy}
-              stroke={isHighlighted ? "#c4b5fd" : "#ececec"}
-              strokeWidth={isHighlighted ? 1.5 : 1}
-              strokeDasharray={isHighlighted ? "none" : "3 4"}
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 1 }}
-              transition={{ delay: 0.2 + nodes.indexOf(node) * 0.08 }}
+        {/* Hover tooltip */}
+        {tooltip && (
+          <div
+            className="absolute pointer-events-none bg-white border border-[#e5e7eb] rounded-xl shadow-sm px-3 py-2 max-w-[200px] z-10"
+            style={{ left: tooltip.x + 12, top: tooltip.y - 10 }}
+          >
+            <p className="font-mono text-[9px] tracking-wide uppercase text-[#9ca3af] mb-0.5">{tooltip.node.type.replace(/_/g, " ")}</p>
+            <p className="text-[12px] font-semibold text-[#111827]">{tooltip.node.label}</p>
+            {tooltip.node.time_window && <p className="text-[11px] text-[#6b7280]">{tooltip.node.time_window}</p>}
+            {tooltip.node.schedule && <p className="text-[11px] text-[#6b7280]">{tooltip.node.schedule}</p>}
+          </div>
+        )}
+      </div>
+
+      {/* Selected node detail panel */}
+      {selectedNode && (
+        <div className="border-t border-[#f3f4f6] px-4 py-3 bg-white">
+          <div className="flex items-center gap-2 mb-2">
+            <span
+              className="w-2 h-2 rounded-full"
+              style={{ backgroundColor: NODE_COLORS[selectedNode.type] ?? "#6b7280" }}
             />
-          );
-        })}
+            <span className="font-mono text-[9px] uppercase tracking-wider text-[#9ca3af]">{selectedNode.type.replace(/_/g, " ")}</span>
+          </div>
+          <p className="text-[13px] font-semibold text-[#111827] mb-1">{selectedNode.label}</p>
+          {selectedNode.description && (
+            <p className="text-[12px] text-[#6b7280] mb-1">{selectedNode.description}</p>
+          )}
+          <div className="flex flex-wrap gap-2 mt-1.5">
+            {selectedNode.time_window && (
+              <span className="text-[11px] bg-[#f0fdf4] text-[#059669] px-2 py-0.5 rounded-full font-mono">{selectedNode.time_window}</span>
+            )}
+            {selectedNode.schedule && (
+              <span className="text-[11px] bg-[#f5f3ff] text-[#7c3aed] px-2 py-0.5 rounded-full font-mono">{selectedNode.schedule}</span>
+            )}
+            {selectedNode.severity && (
+              <span className="text-[11px] bg-[#fef2f2] text-[#dc2626] px-2 py-0.5 rounded-full font-mono">{selectedNode.severity}</span>
+            )}
+            {selectedNode.critical && (
+              <span className="text-[11px] bg-[#fffbeb] text-[#d97706] px-2 py-0.5 rounded-full font-mono">Critical</span>
+            )}
+          </div>
+          {/* Neighbours summary */}
+          {visibleNodes && visibleNodes.size > 1 && (
+            <p className="text-[11px] text-[#9ca3af] mt-2">
+              {visibleNodes.size - 1} connected node{visibleNodes.size > 2 ? "s" : ""}
+            </p>
+          )}
+        </div>
+      )}
 
-        {/* Edge labels — top connection for each highlighted node */}
-        {nodes.map((node) => {
-          if (!highlighted.includes(node.id)) return null;
-          const top = node.connections.find((c) => c.confidence && c.confidence > 0.7);
-          if (!top) return null;
-          const labelR = ringR + 48;
-          const lx = cx + labelR * Math.cos(node.angle);
-          const ly = cy + labelR * Math.sin(node.angle);
-          const anchor = node.x > cx + 8 ? "start" : node.x < cx - 8 ? "end" : "middle";
-          return (
-            <motion.text
-              key={`elabel-${node.id}`}
-              x={lx} y={ly}
-              textAnchor={anchor}
-              dominantBaseline="middle"
-              fontSize="9.5"
-              fill={EDGE_TYPE_COLOR[top.type] ?? "#8b5cf6"}
-              fontFamily="ui-monospace, monospace"
-              fontWeight="600"
-              opacity="0.85"
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 0.85 }}
-              transition={{ delay: 0.6 + nodes.indexOf(node) * 0.05 }}
-            >
-              {top.label}
-            </motion.text>
-          );
-        })}
-
-        {/* Member nodes */}
-        {nodes.map((node, i) => {
-          const color = AGE_COLOR[node.ageGroup] ?? "#6b7280";
-          const hasHealth = node.connections.some((c) => c.type === "health");
-          const namePush = 44;
-          const nx = cx + (ringR + namePush) * Math.cos(node.angle);
-          const ny = cy + (ringR + namePush) * Math.sin(node.angle);
-          const anchor = node.x > cx + 8 ? "start" : node.x < cx - 8 ? "end" : "middle";
-
-          return (
-            <motion.g
-              key={node.id}
-              initial={{ opacity: 0, scale: 0.6 }}
-              animate={{ opacity: 1, scale: 1 }}
-              transition={{ type: "spring", stiffness: 260, damping: 22, delay: 0.15 + i * 0.08 }}
-              style={{ transformOrigin: `${node.x}px ${node.y}px` }}
-            >
-              {hasHealth && (
-                <circle cx={node.x} cy={node.y} r={nodeR + 6} fill="none" stroke={color} strokeWidth="1" opacity="0.2" strokeDasharray="2 3" />
-              )}
-              <circle cx={node.x} cy={node.y} r={nodeR} fill="white" stroke="#e5e7eb" strokeWidth="1.5" />
-              <text
-                x={node.x} y={node.y}
-                textAnchor="middle" dominantBaseline="middle"
-                fontSize="14" fontWeight="700"
-                fill={color}
-                fontFamily="var(--font-space-grotesk), system-ui, sans-serif"
-              >
-                {node.name[0]}
-              </text>
-              {/* Name + age outside ring */}
-              <text x={nx} y={ny - 7} textAnchor={anchor} fontSize="11" fontWeight="600" fill="#374151" fontFamily="var(--font-space-grotesk), system-ui, sans-serif">
-                {node.name}
-              </text>
-              <text x={nx} y={ny + 7} textAnchor={anchor} fontSize="9" fill="#9ca3af" fontFamily="ui-monospace, monospace">
-                {node.age} · {node.role}
-              </text>
-            </motion.g>
-          );
-        })}
-
-        {/* Center — SAATHI node */}
-        <motion.g initial={{ scale: 0 }} animate={{ scale: 1 }} transition={{ type: "spring", stiffness: 200, damping: 20 }} style={{ transformOrigin: `${cx}px ${cy}px` }}>
-          <circle cx={cx} cy={cy} r={44} fill="#111827" />
-          <circle cx={cx} cy={cy} r={49} fill="none" stroke="#8b5cf6" strokeWidth="1" opacity="0.35" />
-          <text x={cx} y={cy - 8} textAnchor="middle" dominantBaseline="middle" fontSize="10" fontWeight="700" fill="white" fontFamily="ui-monospace, monospace" letterSpacing="0.12em">SAATHI</text>
-          <text x={cx} y={cy + 8} textAnchor="middle" dominantBaseline="middle" fontSize="9" fill="#a78bfa" fontFamily="ui-monospace, monospace">
-            {members.reduce((a, m) => a + m.connections.length, 0)} links
-          </text>
-        </motion.g>
-      </svg>
+      {/* Legend */}
+      <div className="px-4 py-3 flex flex-wrap items-center gap-3 border-t border-[#f3f4f6] bg-white">
+        {LEGEND.map(({ color, label }) => (
+          <div key={label} className="flex items-center gap-1.5">
+            <span className="w-2 h-2 rounded-full shrink-0" style={{ backgroundColor: color }} />
+            <span className="text-[10px] text-[#9ca3af]">{label}</span>
+          </div>
+        ))}
+        <span className="text-[10px] text-[#c4b5fd] ml-auto">Tap node to explore</span>
+      </div>
     </div>
   );
 }

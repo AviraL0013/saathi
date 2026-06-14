@@ -40,7 +40,12 @@ export interface RawPattern {
   day_pattern?: string[];
   total_observations?: number;
   total_matches?: number;
+  consecutive_misses?: number;
+  first_observed?: string;
+  last_observed?: string;
   promoted_rule_id?: string | null;
+  promoted_at?: string | null;
+  demoted_at?: string | null;
 }
 
 export interface RawMetrics {

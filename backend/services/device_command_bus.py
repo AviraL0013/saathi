@@ -175,17 +175,19 @@ class DeviceCommandBus:
             from db.dynamo_client import async_execute
             table = get_table("action_log")
             ttl = int(time.time()) + (settings.ACTION_LOG_TTL_DAYS * 86400)
+            now_iso = datetime.now(tz=timezone.utc).isoformat()
             item = {
-                "action_id":   action.action_id,
+                "action_id":    action.action_id,
+                "created_at":   now_iso,          # GSI range key (normalised)
                 "household_id": action.household_id,
-                "timestamp":   datetime.now(tz=timezone.utc).isoformat(),
-                "action_type": action.action_type.value,
-                "source":      action.source.value,
-                "device_id":   action.device_id or "",
-                "command":     action.command or "",
-                "success":     result.success,
-                "latency_ms":  Decimal(str(round(result.latency_ms, 2))),
-                "rule_id":     action.rule_id or "",
+                "timestamp":    now_iso,          # keep for backward compat
+                "action_type":  action.action_type.value,
+                "source":       action.source.value,
+                "device_id":    action.device_id or "",
+                "command":      action.command or "",
+                "success":      result.success,
+                "latency_ms":   Decimal(str(round(result.latency_ms, 2))),
+                "rule_id":      action.rule_id or "",
                 "audit_expiry": ttl,
             }
             if result.error:

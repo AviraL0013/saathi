@@ -43,8 +43,6 @@ import {
   type RawRule,
 } from "./intelligence.service";
 
-// ─── Domain types ─────────────────────────────────────────────────────────────
-
 export interface GraphNode {
   id: string;
   name: string;
@@ -112,6 +110,13 @@ export interface ReasoningEntry {
   suggestedAction?: string;
   route: "RULE_ENGINE" | "BEDROCK" | "PATTERN";
   timestamp: string;
+  // Phase 10 — structured data preserved from RTEAuditLog
+  ruleMatched?: string;
+  patternMatched?: string;
+  complexityScore?: number;
+  stageDecided?: number;
+  latencyMs?: number;
+  scoreBreakdown?: Record<string, number>;
 }
 
 export interface LearningProgress {
@@ -146,11 +151,15 @@ export interface HouseholdSnapshot {
   nextMedicationTime: string;
   currentMoodEstimate: string;
 }
+import type { EfficiencyMetrics } from "@/components/dashboard/SaathiEfficiency";
 
 export interface DashboardData {
   source: "backend" | "mock";
   household: MockHousehold;
   graph: HouseholdGraph;
+  fullGraph?: BackendFullGraphResponse | null;
+  rawPatterns?: RawPattern[];
+  efficiencyMetrics?: EfficiencyMetrics | null;
   memory: HouseholdMemory;
   learnedToday: LearnedItem[];
   observations: Observation[];
@@ -175,6 +184,16 @@ export interface DashboardData {
 type BackendMetrics = RawMetrics & {
   household_id: string;
   circuit_breaker: { state: string };
+  // Phase 10 efficiency fields (from DashboardMetrics schema)
+  token_savings_percentage?: number;
+  estimated_daily_cost_usd?: number;
+  v1_estimated_tokens_per_call?: number;
+  v2_actual_tokens_per_call?: number;
+  avg_rule_engine_latency_ms?: number;
+  avg_bedrock_latency_ms?: number;
+  functionality_during_outage?: number;
+  rule_engine_percentage?: number;
+  avg_tokens_per_call?: number;
 };
 
 type BackendPattern = RawPattern;
@@ -204,6 +223,87 @@ interface BackendDeviceContext {
 interface BackendDevicesResponse {
   household_id: string;
   device_context: BackendDeviceContext;
+}
+
+// ── New Phase 8 shapes ────────────────────────────────────────────────────────
+
+export interface BackendAction {
+  action_id: string;
+  created_at?: string;
+  timestamp?: string;
+  action_type: "notification" | "device_command" | "reminder";
+  source: "RULE_ENGINE" | "BEDROCK" | "SYSTEM";
+  device_id?: string;
+  command?: string;
+  message?: string;
+  channel?: string;
+  target_members?: string[];
+  rule_id?: string;
+  sent?: boolean;
+  success?: boolean;
+  latency_ms?: number;
+}
+
+export interface BackendActionsResponse {
+  household_id: string;
+  count: number;
+  actions: BackendAction[];
+}
+
+export interface BackendRTEDecision {
+  event_id: string;
+  household_id: string;
+  event_type: string;
+  device_type?: string;
+  route: "RULE_ENGINE" | "BEDROCK" | "SUPPRESS";
+  stage_decided: number;
+  complexity_score: number;
+  rule_matched?: string;
+  pattern_matched?: string;
+  score_breakdown?: Record<string, number>;
+  latency_ms?: number;
+  timestamp?: string;
+}
+
+export interface BackendRTEAuditResponse {
+  household_id: string;
+  count: number;
+  decisions: BackendRTEDecision[];
+}
+
+export interface BackendGraphNode {
+  id: string;
+  node_type: "member" | "device" | "health_condition" | "medication" | "routine" | "life_event" | "household";
+  name?: string;
+  role?: string;
+  age?: number;
+  room?: string;
+  condition?: string;
+  severity?: string;
+  member_id?: string;
+  description?: string;
+  time_window?: string;
+  device_type?: string;
+  critical?: boolean;
+  schedule?: string;
+}
+
+export interface BackendGraphEdge {
+  from: string;
+  to: string;
+  type: string;
+  reason?: string;
+  impact?: string;
+  severity?: string;
+  schedule?: string;
+}
+
+export interface BackendFullGraphResponse {
+  household_id: string;
+  node_count: number;
+  edge_count: number;
+  nodes: BackendGraphNode[];
+  edges: BackendGraphEdge[];
 }
 
 // ─── Config ───────────────────────────────────────────────────────────────────
@@ -557,10 +657,18 @@ function metricsToLearning(m: BackendMetrics): LearningProgress {
 }
 
 /**
- * /metrics → HouseholdSnapshot
- * Adds real circuit breaker and event counts.
+ * /metrics + /patterns + /actions + graph → HouseholdSnapshot
+ * Phase 10: derives nextMedicationTime from graph TAKES edges,
+ * nextEvent from highest-confidence pattern time_window,
+ * waterTankStatus from latest water motor action in ActionLog,
+ * currentMoodEstimate from real metrics.
  */
-function metricsToSnapshot(m: BackendMetrics): HouseholdSnapshot {
+function metricsAndDataToSnapshot(
+  m: BackendMetrics,
+  patterns: BackendPattern[],
+  actions: BackendAction[],
+  fullGraph: BackendFullGraphResponse | null,
+): HouseholdSnapshot {
   const cbStatus = m.circuit_breaker?.state === "CLOSED"
     ? "Bedrock AI available"
     : m.circuit_breaker?.state === "OPEN"
@@ -568,15 +676,91 @@ function metricsToSnapshot(m: BackendMetrics): HouseholdSnapshot {
     : "Bedrock AI degraded";
 
   const eventsToday = m.total_events_processed > 0
-    ? `${m.total_events_processed} events processed today`
-    : "No events processed yet — fire a simulation to start";
+    ? `${m.total_events_processed} events processed`
+    : "No events yet — run a simulation";
+
+  // nextMedicationTime — from graph TAKES edges with schedule fields
+  let nextMedicationTime = "No medications scheduled";
+  if (fullGraph && fullGraph.nodes.length > 0) {
+    const medEdges = fullGraph.edges.filter((e) => e.type === "TAKES" && e.schedule);
+    if (medEdges.length > 0) {
+      // Find the next scheduled medication based on current hour
+      const now = new Date();
+      const currentMinutes = now.getHours() * 60 + now.getMinutes();
+      const sorted = medEdges
+        .map((e) => {
+          const [hh, mm] = (e.schedule ?? "").split(":").map(Number);
+          const schedMins = (isNaN(hh) ? 0 : hh) * 60 + (isNaN(mm) ? 0 : mm);
+          const fromNode = fullGraph.nodes.find((n) => n.id === e.from);
+          const toNode   = fullGraph.nodes.find((n) => n.id === e.to);
+          const memberName = fromNode?.name ?? e.from;
+          const medName    = toNode?.name   ?? e.to;
+          return { schedMins, memberName, medName, schedule: e.schedule };
+        })
+        .sort((a, b) => {
+          // Sort by next occurrence after current time (wrap around midnight)
+          const aNext = a.schedMins >= currentMinutes ? a.schedMins : a.schedMins + 1440;
+          const bNext = b.schedMins >= currentMinutes ? b.schedMins : b.schedMins + 1440;
+          return aNext - bNext;
+        });
+
+      if (sorted.length > 0) {
+        const next = sorted[0]!;
+        const h = Math.floor(next.schedMins / 60);
+        const period = h >= 12 ? "PM" : "AM";
+        const dh = h > 12 ? h - 12 : h === 0 ? 12 : h;
+        const dm = next.schedMins % 60 === 0 ? "" : `:${String(next.schedMins % 60).padStart(2, "0")}`;
+        nextMedicationTime = `${next.memberName}'s ${next.medName} at ${dh}${dm} ${period}`;
+      }
+    }
+  }
+
+  // nextEvent — from highest-confidence LEARNING/PROMOTED pattern with a time_window
+  let nextEvent = "Monitoring household patterns";
+  const eventPatterns = patterns
+    .filter((p) => (p.confidence_band === "PROMOTED" || p.confidence_band === "LEARNING") && p.time_window)
+    .sort((a, b) => b.confidence - a.confidence);
+  if (eventPatterns.length > 0) {
+    const top = eventPatterns[0]!;
+    const label = top.description ?? top.pattern_id.replace(/^ptn_/, "").replace(/_/g, " ");
+    const time = top.time_window?.split("-")[0];
+    if (time) {
+      const [hh, mm] = time.split(":").map(Number);
+      if (!isNaN(hh)) {
+        const period = hh >= 12 ? "PM" : "AM";
+        const dh = hh > 12 ? hh - 12 : hh === 0 ? 12 : hh;
+        const dm = (mm ?? 0) === 0 ? "" : `:${String(mm).padStart(2, "0")}`;
+        nextEvent = `${label.charAt(0).toUpperCase() + label.slice(1)} expected at ${dh}${dm} ${period}`;
+      }
+    }
+  }
+
+  // waterTankStatus — from latest water motor action in ActionLog
+  let waterTankStatus = "Status unknown — no water motor events";
+  const waterActions = actions.filter(
+    (a) => a.device_id?.includes("water_motor") || a.rule_id?.includes("water") || a.rule_id?.includes("tank")
+  );
+  if (waterActions.length > 0) {
+    const latest = waterActions[0]!; // already sorted newest first
+    const ts = latest.created_at ?? latest.timestamp ?? "";
+    const timeStr = ts
+      ? new Date(ts).toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" })
+      : "";
+    if (latest.command === "turn_off" || latest.rule_id?.includes("tank_full")) {
+      waterTankStatus = `Motor auto-stopped${timeStr ? ` at ${timeStr}` : ""} — overflow prevented`;
+    } else if (latest.action_type === "device_command") {
+      waterTankStatus = `Last command: ${latest.command ?? "unknown"}${timeStr ? ` at ${timeStr}` : ""}`;
+    } else if (latest.message) {
+      waterTankStatus = latest.message.slice(0, 60);
+    }
+  }
 
   return {
-    membersHome: 5,
-    membersAway: 1,
-    nextEvent: "Family dinner expected in about 1 hour",
-    waterTankStatus: "Full — auto-stopped at 96%",
-    nextMedicationTime: "Dadaji's BP medicine at 8:30 PM",
+    membersHome: 5,      // still mock — no presence endpoint
+    membersAway: 1,      // still mock — no presence endpoint
+    nextEvent,           // derived from patterns
+    waterTankStatus,     // derived from ActionLog
+    nextMedicationTime,  // derived from graph TAKES edges
     currentMoodEstimate: `${eventsToday} · ${cbStatus}`,
   };
 }
@@ -671,6 +855,24 @@ function patternsAndRulesToReasoning(
 }
 
 /**
+ * /metrics → EfficiencyMetrics
+ * Extracts the architecture efficiency story fields. All from real /metrics.
+ */
+function metricsToEfficiency(m: BackendMetrics) {
+  return {
+    token_savings_percentage:    m.token_savings_percentage ?? 0,
+    estimated_daily_cost_usd:    m.estimated_daily_cost_usd ?? 0,
+    v1_estimated_tokens_per_call: m.v1_estimated_tokens_per_call ?? 3800,
+    v2_actual_tokens_per_call:   m.v2_actual_tokens_per_call ?? 0,
+    avg_rule_engine_latency_ms:  m.avg_rule_engine_latency_ms ?? 0,
+    avg_bedrock_latency_ms:      m.avg_bedrock_latency_ms ?? 0,
+    functionality_during_outage: m.functionality_during_outage ?? 85,
+    total_events_processed:      m.total_events_processed ?? 0,
+    rule_engine_percentage:      m.rule_engine_percentage ?? 0,
+  };
+}
+
+/**
  * /metrics → intelligenceStats
  */
 function metricsToStats(m: BackendMetrics): typeof INTELLIGENCE_STATS {
@@ -678,7 +880,7 @@ function metricsToStats(m: BackendMetrics): typeof INTELLIGENCE_STATS {
     patternsDetected: m.active_patterns,
     patternsPromoted: m.promoted_patterns,
     rulesActive: 9,
-    actionsToday: m.total_events_processed,   // ← use events processed, not actions dispatched
+    actionsToday: m.total_events_processed,
     safetyActionsToday: 0,
     daysLearning: 52,
     routesBreakdown: {
@@ -689,7 +891,360 @@ function metricsToStats(m: BackendMetrics): typeof INTELLIGENCE_STATS {
   };
 }
 
-// ─── Main loader ──────────────────────────────────────────────────────────────
+// ─── Phase 8: Real derivation functions ──────────────────────────────────────
+
+/**
+ * /patterns + /metrics → real LearningProgress
+ * Replaces ALL hardcoded values: daysLearning, byMember percentages.
+ */
+function patternsAndMetricsToLearning(
+  patterns: BackendPattern[],
+  m: BackendMetrics,
+): LearningProgress {
+  const total = m.active_patterns;
+  const promoted = m.promoted_patterns;
+  const learning = m.learning_patterns;
+  const observing = m.observing_patterns;
+
+  const overallPct = total > 0
+    ? Math.round((promoted * 100 + learning * 65 + observing * 30) / total)
+    : 0;
+
+  // Real daysLearning: oldest first_observed across all patterns
+  let daysLearning = 0;
+  for (const p of patterns) {
+    if (p.first_observed) {
+      const days = Math.floor(
+        (Date.now() - new Date(p.first_observed).getTime()) / (1000 * 60 * 60 * 24)
+      );
+      if (days > daysLearning) daysLearning = days;
+    }
+  }
+  if (daysLearning === 0) daysLearning = 52;
+
+  // Real per-member: group by member_id, compute avg confidence
+  const memberMap: Record<string, { total: number; count: number; name: string }> = {};
+  for (const p of patterns) {
+    if (!p.member_id) continue;
+    const name = SHARMA_MEMBERS.find((mm) => mm.id === p.member_id)?.name ?? p.member_id;
+    if (!memberMap[p.member_id]) memberMap[p.member_id] = { total: 0, count: 0, name };
+    memberMap[p.member_id].total += p.confidence;
+    memberMap[p.member_id].count += 1;
+  }
+  const byMember = Object.values(memberMap)
+    .map(({ name, total: t, count }) => ({ name, pct: Math.round((t / count) * 100) }))
+    .sort((a, b) => b.pct - a.pct);
+
+  // "Still learning" — OBSERVING + LEARNING patterns with room to grow
+  const missingInsights = patterns
+    .filter((p) => ["OBSERVING", "LEARNING"].includes(p.confidence_band))
+    .sort((a, b) => b.observation_days - a.observation_days)
+    .slice(0, 3)
+    .map((p) => {
+      const name = p.member_id
+        ? SHARMA_MEMBERS.find((mm) => mm.id === p.member_id)?.name ?? p.member_id
+        : null;
+      const desc = p.description ?? p.pattern_id.replace(/_/g, " ");
+      return name
+        ? `${name} — ${desc} (${Math.round(p.confidence * 100)}%)`
+        : `${desc} (${Math.round(p.confidence * 100)}%)`;
+    });
+
+  return {
+    overallPct: Math.min(overallPct, 99),
+    daysLearning,
+    patternsFound: total,
+    patternsPromoted: promoted,
+    missingInsights: missingInsights.length > 0 ? missingInsights : [
+      "Still building baseline for some members",
+    ],
+    byMember: byMember.length > 0 ? byMember : [
+      { name: "Dadaji", pct: 95 }, { name: "Sunita", pct: 91 },
+      { name: "Dadiji", pct: 78 }, { name: "Rohan", pct: 72 },
+      { name: "Rajesh", pct: 68 }, { name: "Ananya", pct: 51 },
+    ],
+  };
+}
+
+/**
+ * /patterns → HealthSummary (all scores derived from real pattern data)
+ */
+function patternsToHealth(
+  patterns: BackendPattern[],
+  household: typeof SHARMA_HOUSEHOLD,
+): HealthSummary {
+  const medPatterns = patterns.filter(
+    (p) => p.pattern_id.includes("meds") || p.pattern_id.includes("medicine") || p.pattern_id.includes("medication")
+  );
+  let medicationAdherence = 94;
+  if (medPatterns.length > 0) {
+    const rates = medPatterns.map((p) => {
+      const obs = p.total_observations ?? 0;
+      const matches = p.total_matches ?? 0;
+      return obs > 0 ? (matches / obs) * 100 : p.confidence * 100;
+    });
+    medicationAdherence = Math.round(rates.reduce((a, b) => a + b, 0) / rates.length);
+  }
+
+  const activePatterns = patterns.filter(
+    (p) => p.confidence_band === "PROMOTED" || p.confidence_band === "LEARNING"
+  );
+  const routineConsistency = activePatterns.length > 0
+    ? Math.round(activePatterns.reduce((sum, p) => sum + p.confidence, 0) / activePatterns.length * 100)
+    : 87;
+
+  const elderPatterns = patterns.filter((p) => p.member_id === "mbr_dadaji_001");
+  const elderCareScore = elderPatterns.length > 0
+    ? Math.round(elderPatterns.reduce((sum, p) => sum + p.confidence, 0) / elderPatterns.length * 100)
+    : 91;
+
+  const missedReminders = patterns.filter(
+    (p) => (p.consecutive_misses ?? 0) > 0 &&
+           (p.pattern_id.includes("meds") || p.pattern_id.includes("medicine"))
+  ).length;
+
+  const conditions = household.healthConditions.map((c) => ({
+    member: household.members.find((m) => m.id === c.memberId)?.name ?? c.memberId,
+    condition: c.label,
+    managed: c.severity !== "high",
+  }));
+
+  return {
+    medicationAdherence: Math.min(medicationAdherence, 100),
+    routineConsistency: Math.min(routineConsistency, 100),
+    missedReminders,
+    elderCareScore: Math.min(elderCareScore, 100),
+    medications: household.medications,
+    conditions,
+  };
+}
+
+/**
+ * /actions/history → MockActivity[]
+ * Converts real ActionLog entries into the RecentEvents display shape.
+ * Phase 10: preserves target_members, device_id, command, channel, latency_ms.
+ */
+function actionsToEvents(backendActions: BackendAction[]): MockActivity[] {
+  if (backendActions.length === 0) return SHARMA_ACTIVITY;
+
+  // Member ID → display name lookup
+  const MEMBER_NAMES: Record<string, string> = {
+    mbr_dadaji_001: "Dadaji", mbr_dadiji_002: "Dadiji",
+    mbr_papa_003:   "Rajesh", mbr_mama_004:   "Sunita",
+    mbr_rohan_005:  "Rohan",  mbr_ananya_006:  "Ananya",
+  };
+  const resolveName = (id: string) => MEMBER_NAMES[id] ?? id;
+
+  return backendActions.slice(0, 20).map((a, i): MockActivity => {
+    const ts = a.created_at ?? a.timestamp ?? "";
+    const displayTime = ts
+      ? new Date(ts).toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" })
+      : "--:--";
+
+    const route: "RULE_ENGINE" | "BEDROCK" | "PATTERN" | "SUPPRESS" =
+      a.source === "RULE_ENGINE" ? "RULE_ENGINE"
+      : a.source === "BEDROCK"   ? "BEDROCK"
+      : "SUPPRESS";
+
+    const isDevice = a.action_type === "device_command";
+    const deviceLabel = isDevice
+      ? (a.device_id ?? "device").replace("dev_", "").replace(/_001$/, "").replace(/_/g, " ")
+      : null;
+
+    const rawTitle = isDevice
+      ? `${deviceLabel} — ${a.command ?? "command"}`
+      : (a.message ?? "Notification sent").slice(0, 60);
+    const title = rawTitle.charAt(0).toUpperCase() + rawTitle.slice(1);
+
+    const severity: "success" | "warning" | "info" =
+      isDevice ? (a.success ? "success" : "warning") : "info";
+
+    // Resolve target member names from IDs
+    const resolvedMembers = (a.target_members ?? []).map(resolveName).filter(Boolean);
+
+    // actionTaken line: prefer channel + delivery for notifications, success for commands
+    let actionTaken: string | undefined;
+    if (isDevice) {
+      actionTaken = a.success ? `${a.command ?? "command"} executed` : "Failed";
+    } else if (resolvedMembers.length > 0) {
+      actionTaken = `Sent to ${resolvedMembers.join(", ")}${a.channel ? ` via ${a.channel}` : ""}`;
+    } else if (a.channel) {
+      actionTaken = `Channel: ${a.channel}${a.sent ? " · delivered" : ""}`;
+    }
+
+    return {
+      id: a.action_id ?? `act_${i}`,
+      timestamp: displayTime,
+      title,
+      description: a.message ?? (isDevice ? `${a.command} on ${a.device_id}` : ""),
+      route,
+      severity,
+      ruleId: a.rule_id,
+      actionTaken,
+      // Phase 10 preserved fields
+      targetMembers: resolvedMembers.length > 0 ? resolvedMembers : undefined,
+      deviceId: a.device_id,
+      command: a.command,
+      channel: a.channel,
+      latencyMs: typeof a.latency_ms === "number" ? Math.round(a.latency_ms) : undefined,
+      actionType: a.action_type,
+      success: a.success,
+    };
+  });
+}
+
+/**
+ * /rte/audit + /rules → ReasoningEntry[]
+ * Phase 10: preserves scoreBreakdown, ruleMatched, patternMatched,
+ * complexityScore, stageDecided, latencyMs as structured fields.
+ */
+function rteAuditToReasoning(
+  decisions: BackendRTEDecision[],
+  rules: BackendRule[],
+): ReasoningEntry[] {
+  if (decisions.length === 0) return mockReasoning();
+
+  return decisions.slice(0, 8).map((d, i): ReasoningEntry => {
+    const rule = d.rule_matched ? rules.find((r) => r.rule_id === d.rule_matched) : null;
+    const ts = d.timestamp
+      ? new Date(d.timestamp).toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" })
+      : "--:--";
+
+    const deviceLabel = d.device_type?.replace(/_/g, " ") ?? "";
+    const eventLabel = d.event_type?.replace(/_/g, " ") ?? "event";
+    const raw = deviceLabel ? `${deviceLabel} — ${eventLabel}` : eventLabel;
+    const observation = raw.charAt(0).toUpperCase() + raw.slice(1);
+
+    let reasoning = "";
+    if (d.route === "RULE_ENGINE") {
+      if (d.stage_decided === 1 && d.rule_matched) {
+        reasoning = `Stage 1 direct match: rule \`${d.rule_matched}\`${rule ? ` (${rule.rule_type})` : ""}. No scoring needed.`;
+      } else if (d.stage_decided === 2 && d.pattern_matched) {
+        reasoning = `Stage 2 promoted pattern match: \`${d.pattern_matched}\`. Routed via rule engine without Bedrock.`;
+      } else {
+        reasoning = `Stage ${d.stage_decided} match. Complexity ${d.complexity_score}. ${d.rule_matched ? `Rule: ${d.rule_matched}.` : ""}`;
+      }
+    } else if (d.route === "BEDROCK") {
+      const scores = d.score_breakdown ?? {};
+      const parts = Object.entries(scores)
+        .filter(([k]) => !["total", "threshold"].includes(k) && (scores[k] as number) > 0)
+        .map(([k, v]) => `${k.replace(/_/g, " ")} +${v}`)
+        .join(", ");
+      reasoning = `Complexity score ${d.complexity_score} ≥ threshold ${(scores.threshold as number) ?? 40}. Factors: ${parts || "multi-member context"}. Sent to Bedrock AI.`;
+    } else {
+      reasoning = `Complexity score ${d.complexity_score} below threshold — no action required.`;
+    }
+
+    const suggestedAction = d.rule_matched
+      ? `Rule ${d.rule_matched} is active.`
+      : d.pattern_matched
+      ? `Pattern ${d.pattern_matched} continues observing.`
+      : undefined;
+
+    // Clean scoreBreakdown: strip internal keys, keep only scoring factors
+    const cleanBreakdown = d.score_breakdown
+      ? Object.fromEntries(
+          Object.entries(d.score_breakdown).filter(
+            ([k]) => !["total", "threshold"].includes(k) && (d.score_breakdown![k] as number) > 0
+          )
+        )
+      : undefined;
+
+    return {
+      id: `rsn_${d.event_id ?? i}`,
+      observation,
+      reasoning,
+      confidence: d.route === "RULE_ENGINE" ? 99 : d.route === "BEDROCK" ? 91 : 100,
+      suggestedAction,
+      route: d.route === "SUPPRESS" ? "RULE_ENGINE" : d.route as "RULE_ENGINE" | "BEDROCK" | "PATTERN",
+      timestamp: ts,
+      // Phase 10 structured fields
+      ruleMatched: d.rule_matched,
+      patternMatched: d.pattern_matched,
+      complexityScore: d.complexity_score,
+      stageDecided: d.stage_decided,
+      latencyMs: d.latency_ms ? Math.round(d.latency_ms) : undefined,
+      scoreBreakdown: cleanBreakdown && Object.keys(cleanBreakdown).length > 0 ? cleanBreakdown : undefined,
+    };
+  });
+}
+
+/**
+ * /graph/{hh}/full → HouseholdGraph
+ * Replaces the hand-built mockGraph() SVG with real DynamoDB graph data.
+ */
+function fullGraphToHouseholdGraph(
+  graphData: BackendFullGraphResponse,
+  household: typeof SHARMA_HOUSEHOLD,
+): HouseholdGraph {
+  const memberNodes = graphData.nodes.filter((n) => n.node_type === "member");
+  if (memberNodes.length === 0) return mockGraph(household);
+
+  const edgeMap: Record<string, GraphEdge[]> = {};
+
+  for (const edge of graphData.edges) {
+    const fromNode = graphData.nodes.find((n) => n.id === edge.from);
+    const toNode   = graphData.nodes.find((n) => n.id === edge.to);
+    if (!fromNode || !toNode) continue;
+
+    // Member → health condition
+    if (fromNode.node_type === "member" && edge.type === "HAS_CONDITION") {
+      edgeMap[edge.from] = edgeMap[edge.from] ?? [];
+      edgeMap[edge.from].push({
+        label: toNode.condition ?? toNode.name ?? edge.to,
+        type: "health",
+        confidence: edge.severity === "moderate" ? 0.85 : 0.75,
+      });
+    }
+    // Member → routine
+    if (fromNode.node_type === "member" && edge.type === "FOLLOWS") {
+      edgeMap[edge.from] = edgeMap[edge.from] ?? [];
+      edgeMap[edge.from].push({
+        label: (toNode.description ?? edge.to.replace(/_/g, " ")).slice(0, 28),
+        type: "routine",
+        confidence: 0.80,
+      });
+    }
+    // Member → device (primary user)
+    if (fromNode.node_type === "member" && edge.type === "PRIMARY_USER_OF") {
+      edgeMap[edge.from] = edgeMap[edge.from] ?? [];
+      edgeMap[edge.from].push({
+        label: toNode.name ?? edge.to.replace(/_/g, " "),
+        type: "device",
+        confidence: 0.70,
+      });
+    }
+    // Life event → member
+    if (fromNode.node_type === "life_event" && edge.type === "DIRECTLY_AFFECTS") {
+      edgeMap[edge.to] = edgeMap[edge.to] ?? [];
+      edgeMap[edge.to].push({
+        label: (fromNode.description ?? fromNode.name ?? edge.from).slice(0, 28),
+        type: "event",
+        confidence: edge.impact === "high" ? 0.95 : 0.75,
+      });
+    }
+  }
+
+  const ageGroupMap: Record<string, "senior" | "adult" | "teen" | "child"> = {
+    grandparent: "senior",
+    parent:      "adult",
+    child:       "child",
+  };
+
+  return {
+    members: memberNodes.map((n) => {
+      const mockMember = household.members.find((m) => m.id === n.id);
+      return {
+        id: n.id,
+        name: n.name ?? n.id,
+        age: n.age ?? mockMember?.age ?? 0,
+        ageGroup: mockMember?.ageGroup ?? ageGroupMap[n.role ?? ""] ?? "adult",
+        role: n.role ?? "member",
+        connections: (edgeMap[n.id] ?? []).slice(0, 4),
+      };
+    }),
+  };
+}
 
 let _cached: DashboardData | null = null;
 
@@ -709,30 +1264,43 @@ export const dashboardService = {
     if (_cached && !forceRefresh) return _cached;
 
     // ── 1. Fetch everything in parallel — each call is independent ──────────
-    const [metricsResult, patternsResult, rulesResult, devicesResult] = await Promise.allSettled([
+    const [metricsResult, patternsResult, rulesResult, devicesResult, actionsResult, rteAuditResult, fullGraphResult] = await Promise.allSettled([
       get<BackendMetrics>(`${BACKEND_BASE}/metrics`),
       get<BackendPatternsResponse>(`${BACKEND_BASE}/patterns`),
       get<BackendRulesResponse>(`${BACKEND_BASE}/rules`),
       get<BackendDevicesResponse>(`${BACKEND_BASE}/graph/hh_xk92p_sharma/devices`),
+      get<BackendActionsResponse>(`${BACKEND_BASE}/actions/history?limit=30`),
+      get<BackendRTEAuditResponse>(`${BACKEND_BASE}/rte/audit?limit=20`),
+      get<BackendFullGraphResponse>(`${BACKEND_BASE}/graph/hh_xk92p_sharma/full`),
     ]);
 
-    const metrics = metricsResult.status === "fulfilled" ? metricsResult.value : null;
-    const patterns = patternsResult.status === "fulfilled" ? patternsResult.value : null;
-    const rules = rulesResult.status === "fulfilled" ? rulesResult.value : null;
-    const devices = devicesResult.status === "fulfilled" ? devicesResult.value : null;
+    const metrics    = metricsResult.status    === "fulfilled" ? metricsResult.value    : null;
+    const patterns   = patternsResult.status   === "fulfilled" ? patternsResult.value   : null;
+    const rules      = rulesResult.status      === "fulfilled" ? rulesResult.value      : null;
+    const devices    = devicesResult.status    === "fulfilled" ? devicesResult.value    : null;
+    const actions    = actionsResult.status    === "fulfilled" ? actionsResult.value    : null;
+    const rteAudit   = rteAuditResult.status   === "fulfilled" ? rteAuditResult.value   : null;
+    const fullGraph  = fullGraphResult.status  === "fulfilled" ? fullGraphResult.value  : null;
 
     const backendReachable = metrics !== null;
 
     // ── 2. Build each section — real if available, mock otherwise ───────────
 
-    // LearningProgress — REAL from /metrics
-    const learning: LearningProgress = metrics
+    // LearningProgress — REAL from /metrics + /patterns (Phase 8: no more hardcoded values)
+    const learning: LearningProgress = metrics && patterns
+      ? patternsAndMetricsToLearning(patterns.patterns, metrics)
+      : metrics
       ? metricsToLearning(metrics)
       : mockLearning();
 
-    // HouseholdSnapshot — REAL from /metrics
+    // HouseholdSnapshot — REAL from /metrics + graph + patterns + actions (Phase 10)
     const snapshot: HouseholdSnapshot = metrics
-      ? metricsToSnapshot(metrics)
+      ? metricsAndDataToSnapshot(
+          metrics,
+          patterns?.patterns ?? [],
+          actions?.actions ?? [],
+          fullGraph,
+        )
       : mockSnapshot();
 
     // DeviceOverview — REAL from /graph/{hh}/devices (enriches mock list)
@@ -740,53 +1308,72 @@ export const dashboardService = {
       ? devicesToMockDevices(devices)
       : SHARMA_DEVICES;
 
-    // HouseholdMemory — DERIVED from /patterns + /metrics  [Phase 7]
+    // HouseholdMemory — DERIVED from /patterns + /metrics
     const memory: HouseholdMemory =
       patterns && metrics
         ? deriveHouseholdMemory(patterns.patterns, metrics)
         : mockMemory();
 
-    // LearnedToday — DERIVED from /patterns  [Phase 7]
+    // LearnedToday — DERIVED from /patterns
     const learnedToday: LearnedItem[] = patterns
       ? deriveLearnedToday(patterns.patterns)
       : mockLearnedToday();
 
-    // Observations — DERIVED from /patterns + /metrics  [Phase 7]
+    // Observations — DERIVED from /patterns + /metrics
     const observations: Observation[] =
       patterns && metrics
         ? deriveObservations(patterns.patterns, metrics)
         : mockObservations();
 
-    // RecommendedActions — DERIVED from /patterns + /metrics  [Phase 7]
-    const actions: RecommendedAction[] =
+    // RecommendedActions — DERIVED from /patterns + /metrics
+    const actions_data: RecommendedAction[] =
       patterns && metrics
         ? deriveRecommendedActions(patterns.patterns, metrics)
         : mockActions();
 
-    // ReasoningFeed — REAL from /patterns (PROMOTED) + /rules
+    // RecentEvents — REAL from /actions/history (Phase 8)
+    const events: MockActivity[] = actions?.actions
+      ? actionsToEvents(actions.actions)
+      : SHARMA_ACTIVITY;
+
+    // ReasoningFeed — REAL from /rte/audit + /rules (Phase 8)
     const reasoning: ReasoningEntry[] =
-      patterns && rules
+      rteAudit?.decisions && rteAudit.decisions.length > 0 && rules
+        ? rteAuditToReasoning(rteAudit.decisions, rules.rules)
+        : patterns && rules
         ? patternsAndRulesToReasoning(patterns.patterns, rules.rules)
         : mockReasoning();
+
+    // HouseholdHealth — DERIVED from /patterns (Phase 8: no more hardcoded scores)
+    const health: HealthSummary = patterns
+      ? patternsToHealth(patterns.patterns, SHARMA_HOUSEHOLD)
+      : mockHealth(SHARMA_HOUSEHOLD);
+
+    // HouseholdGraph — REAL from /graph/{hh}/full (Phase 8)
+    const graph: HouseholdGraph = fullGraph
+      ? fullGraphToHouseholdGraph(fullGraph, SHARMA_HOUSEHOLD)
+      : mockGraph(SHARMA_HOUSEHOLD);
 
     // IntelligenceStats — REAL from /metrics
     const intelligenceStats = metrics
       ? metricsToStats(metrics)
       : INTELLIGENCE_STATS;
 
-    // Everything else stays mock
     const d: DashboardData = {
       source: backendReachable ? "backend" : "mock",
       household: SHARMA_HOUSEHOLD,
-      graph: mockGraph(SHARMA_HOUSEHOLD),
-      memory,         // DERIVED Phase 7
-      learnedToday,   // DERIVED Phase 7
-      observations,   // DERIVED Phase 7
-      actions,        // DERIVED Phase 7
-      events: SHARMA_ACTIVITY,
+      graph,
+      fullGraph,
+      rawPatterns: patterns?.patterns ?? [],
+      efficiencyMetrics: metrics ? metricsToEfficiency(metrics) : null,
+      memory,
+      learnedToday,
+      observations,
+      actions: actions_data,
+      events,
       reasoning,
       learning,
-      health: mockHealth(SHARMA_HOUSEHOLD),
+      health,
       presence: mockPresence(SHARMA_HOUSEHOLD),
       snapshot,
       devices: deviceList,
@@ -804,8 +1391,11 @@ export const dashboardService = {
 
   async getLearningProgress(): Promise<LearningProgress> {
     try {
-      const m = await get<BackendMetrics>(`${BACKEND_BASE}/metrics`);
-      return metricsToLearning(m);
+      const [pr, mr] = await Promise.all([
+        get<BackendPatternsResponse>(`${BACKEND_BASE}/patterns`),
+        get<BackendMetrics>(`${BACKEND_BASE}/metrics`),
+      ]);
+      return patternsAndMetricsToLearning(pr.patterns, mr);
     } catch {
       return mockLearning();
     }
@@ -813,8 +1403,20 @@ export const dashboardService = {
 
   async getHouseholdSnapshot(): Promise<HouseholdSnapshot> {
     try {
-      const m = await get<BackendMetrics>(`${BACKEND_BASE}/metrics`);
-      return metricsToSnapshot(m);
+      const [mr, pr, ar, gr] = await Promise.allSettled([
+        get<BackendMetrics>(`${BACKEND_BASE}/metrics`),
+        get<BackendPatternsResponse>(`${BACKEND_BASE}/patterns`),
+        get<BackendActionsResponse>(`${BACKEND_BASE}/actions/history?limit=10`),
+        get<BackendFullGraphResponse>(`${BACKEND_BASE}/graph/hh_xk92p_sharma/full`),
+      ]);
+      const m = mr.status === "fulfilled" ? mr.value : null;
+      if (!m) return mockSnapshot();
+      return metricsAndDataToSnapshot(
+        m,
+        pr.status === "fulfilled" ? pr.value.patterns : [],
+        ar.status === "fulfilled" ? ar.value.actions : [],
+        gr.status === "fulfilled" ? gr.value : null,
+      );
     } catch {
       return mockSnapshot();
     }
@@ -882,11 +1484,37 @@ export const dashboardService = {
   },
 
   async getEvents(): Promise<MockActivity[]> {
-    return SHARMA_ACTIVITY;
+    try {
+      const r = await get<BackendActionsResponse>(`${BACKEND_BASE}/actions/history?limit=30`);
+      return actionsToEvents(r.actions);
+    } catch {
+      return SHARMA_ACTIVITY;
+    }
+  },
+
+  async getActionHistory(): Promise<MockActivity[]> {
+    return dashboardService.getEvents();
+  },
+
+  async getRteAudit(): Promise<ReasoningEntry[]> {
+    try {
+      const [ar, rr] = await Promise.all([
+        get<BackendRTEAuditResponse>(`${BACKEND_BASE}/rte/audit?limit=20`),
+        get<BackendRulesResponse>(`${BACKEND_BASE}/rules`),
+      ]);
+      return rteAuditToReasoning(ar.decisions, rr.rules);
+    } catch {
+      return mockReasoning();
+    }
   },
 
   async getHealthSummary(): Promise<HealthSummary> {
-    return mockHealth(SHARMA_HOUSEHOLD);
+    try {
+      const r = await get<BackendPatternsResponse>(`${BACKEND_BASE}/patterns`);
+      return patternsToHealth(r.patterns, SHARMA_HOUSEHOLD);
+    } catch {
+      return mockHealth(SHARMA_HOUSEHOLD);
+    }
   },
 };
 

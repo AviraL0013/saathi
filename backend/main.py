@@ -74,7 +74,7 @@ from services.action_planner import ActionPlanner
 from services.bedrock_layer import BedrockLayer, BedrockCircuitBreaker, ContextBuilder
 from config import settings
 from services.context_engine import ContextEngine
-from db.dynamo_client import health_check
+from db.dynamo_client import health_check, get_table
 from db.seed_dynamo import run_full_seed
 from services.device_command_bus import DeviceCommandBus
 from services.event_batcher import EventBatcher
@@ -802,17 +802,29 @@ async def reload_rules():
 
 @app.get("/patterns", tags=["Patterns"])
 async def get_patterns():
-    """Return all patterns with their confidence bands."""
+    """Return all patterns with full fields for the intelligence layer."""
     patterns = graph_repo.get_patterns(HH_ID)
     return {
         "count": len(patterns),
         "patterns": [
             {
-                "pattern_id": p.get("pattern_id"),
-                "confidence": float(p.get("confidence", 0)),
-                "confidence_band": p.get("confidence_band"),
-                "observation_days": p.get("observation_days", 0),
+                "pattern_id":       p.get("pattern_id"),
+                "description":      p.get("description"),
+                "confidence":       float(p.get("confidence", 0)),
+                "confidence_band":  p.get("confidence_band"),
+                "observation_days": int(p.get("observation_days", 0)),
+                "member_id":        p.get("member_id"),
+                "device_type":      p.get("device_type"),
+                "time_window":      p.get("time_window"),
+                "day_pattern":      p.get("day_pattern"),
+                "total_observations": int(p.get("total_observations", 0)),
+                "total_matches":    int(p.get("total_matches", 0)),
+                "consecutive_misses": int(p.get("consecutive_misses", 0)),
+                "first_observed":   p.get("first_observed"),
+                "last_observed":    p.get("last_observed"),
                 "promoted_rule_id": p.get("promoted_rule_id"),
+                "promoted_at":      p.get("promoted_at"),
+                "demoted_at":       p.get("demoted_at"),
             }
             for p in patterns
         ],
@@ -824,6 +836,145 @@ async def run_promotion():
     """Scan all patterns and promote eligible ones."""
     newly_promoted = pattern_engine.promote_if_eligible(HH_ID)
     return {"status": "ok", "newly_promoted": newly_promoted}
+
+
+# ── Action History ────────────────────────────────────────────
+
+@app.get("/actions/history", tags=["Actions"])
+async def get_action_history(limit: int = 50):
+    """
+    Return recent actions from the ActionLog table, newest first.
+    Used by the frontend RecentEvents component to replace static mocks.
+
+    Notes:
+    - NotificationService writes `created_at` as the range key.
+    - DeviceCommandBus writes `timestamp` (no range key set, so created_at may be missing).
+    - We query via household_id-index (GSI), sort by created_at descending.
+    - Items that lack created_at fall through via a Scan fallback.
+    """
+    from boto3.dynamodb.conditions import Key as DKey
+    from graph_repository import _decimal_to_native
+    table = get_table("action_log")
+    try:
+        resp = table.query(
+            IndexName="household_id-index",
+            KeyConditionExpression=DKey("household_id").eq(HH_ID),
+            ScanIndexForward=False,   # newest first
+            Limit=limit,
+        )
+        items = resp.get("Items", [])
+        actions = [_decimal_to_native(item) for item in items]
+        # Normalise: some rows use `timestamp`, some use `created_at`
+        for a in actions:
+            if "created_at" not in a and "timestamp" in a:
+                a["created_at"] = a["timestamp"]
+        # Sort by created_at descending (strings in ISO format sort correctly)
+        actions.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+        return {"household_id": HH_ID, "count": len(actions), "actions": actions}
+    except Exception as e:
+        logger.warning(f"ActionLog query failed: {e}")
+        return {"household_id": HH_ID, "count": 0, "actions": [], "error": str(e)}
+
+
+# ── RTE Audit ─────────────────────────────────────────────────
+
+@app.get("/rte/audit", tags=["RTE"])
+async def get_rte_audit(limit: int = 30):
+    """
+    Return recent RTE routing decisions from RTEAuditLog, newest first.
+    Used by ReasoningFeed to show actual decision timeline.
+    Queries using the household_id-index GSI.
+    """
+    from boto3.dynamodb.conditions import Key as DKey
+    table = get_table("rte_audit_log")
+    try:
+        resp = table.query(
+            IndexName="household_id-index",
+            KeyConditionExpression=DKey("household_id").eq(HH_ID),
+            ScanIndexForward=False,
+            Limit=limit,
+        )
+        items = resp.get("Items", [])
+        from graph_repository import _decimal_to_native
+        decisions = [_decimal_to_native(item) for item in items]
+        return {"household_id": HH_ID, "count": len(decisions), "decisions": decisions}
+    except Exception as e:
+        logger.warning(f"RTEAuditLog query failed: {e}")
+        return {"household_id": HH_ID, "count": 0, "decisions": [], "error": str(e)}
+
+
+# ── RTE Decision (single event, for backward compat with reasoning.service.ts) ──
+
+@app.get("/rte/decision/{event_id}", tags=["RTE"])
+async def get_rte_decision(event_id: str):
+    """Look up a single RTE routing decision by event_id."""
+    table = get_table("rte_audit_log")
+    try:
+        from boto3.dynamodb.conditions import Key as DKey
+        resp = table.query(
+            KeyConditionExpression=DKey("event_id").eq(event_id),
+            Limit=1,
+        )
+        items = resp.get("Items", [])
+        if not items:
+            raise HTTPException(status_code=404, detail=f"Event {event_id} not found in audit log")
+        from graph_repository import _decimal_to_native
+        return _decimal_to_native(items[0])
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── Full Graph ────────────────────────────────────────────────
+
+@app.get("/graph/{household_id}/full", tags=["Graph"])
+async def get_full_graph(household_id: str):
+    """
+    Return all graph nodes and edges for the household.
+    Used by HouseholdGraph component to replace the hardcoded SVG mock.
+    """
+    try:
+        g = graph_repo.load_graph(household_id)
+        nodes = []
+        for node_id, attrs in g.nodes(data=True):
+            if attrs.get("node_type"):   # only real typed nodes
+                nodes.append({
+                    "id": node_id,
+                    "node_type": attrs.get("node_type"),
+                    "name": attrs.get("name", node_id),
+                    "role": attrs.get("role"),
+                    "age": attrs.get("age"),
+                    "room": attrs.get("room"),
+                    "condition": attrs.get("condition"),
+                    "severity": attrs.get("severity"),
+                    "member_id": attrs.get("member_id"),
+                    "description": attrs.get("description"),
+                    "time_window": attrs.get("time_window"),
+                    "device_type": attrs.get("device_type"),
+                    "critical": attrs.get("critical"),
+                    "schedule": attrs.get("schedule"),
+                })
+        edges = []
+        for from_node, to_node, edata in g.edges(data=True):
+            edges.append({
+                "from": from_node,
+                "to": to_node,
+                "type": edata.get("edge_type"),
+                "reason": edata.get("reason"),
+                "impact": edata.get("impact"),
+                "severity": edata.get("severity"),
+                "schedule": edata.get("schedule"),
+            })
+        return {
+            "household_id": household_id,
+            "node_count": len(nodes),
+            "edge_count": len(edges),
+            "nodes": nodes,
+            "edges": edges,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ─────────────────────────────────────────────────────────────

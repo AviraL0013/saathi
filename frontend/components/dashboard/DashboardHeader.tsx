@@ -17,7 +17,7 @@ function useTime(city: string) {
   return now.toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit", timeZone: "Asia/Kolkata" });
 }
 
-export function DashboardHeader({ data }: { data: DashboardData }) {
+export function DashboardHeader({ data, wsConnected }: { data: DashboardData; wsConnected?: boolean }) {
   const greeting = useGreeting();
   const time = useTime(data.household.city);
   const { intelligenceStats, household } = data;
@@ -68,10 +68,23 @@ export function DashboardHeader({ data }: { data: DashboardData }) {
             <Sparkles size={10} className="text-[#8b5cf6]" />
             <span className="font-mono text-[11px] text-[#8b5cf6] font-semibold">{household.daysLearning}d learning</span>
           </div>
+          {/* WebSocket live indicator */}
+          {wsConnected !== undefined && (
+            <div
+              className="flex items-center gap-1 px-2 py-1 rounded-full border bg-white"
+              style={{ borderColor: wsConnected ? "#d1fae5" : "#e5e7eb" }}
+              title={wsConnected ? "Live WebSocket connected — dashboard updates automatically" : "WebSocket disconnected — data is static"}
+            >
+              <span
+                className={`w-1.5 h-1.5 rounded-full ${wsConnected ? "bg-[#10b981] animate-pulse" : "bg-[#d1d5db]"}`}
+              />
+              <span className="font-mono text-[10px] text-[#9ca3af]">{wsConnected ? "Live" : "Polling"}</span>
+            </div>
+          )}
           {/* Source */}
           <div className="flex items-center gap-1 px-2 py-1 rounded-full border border-[#e5e7eb] bg-white">
             <span className={`w-1.5 h-1.5 rounded-full ${data.source === "backend" ? "bg-[#10b981]" : "bg-[#f59e0b]"} animate-pulse`} />
-            <span className="font-mono text-[10px] text-[#9ca3af]">{data.source === "backend" ? "Live" : "Demo"}</span>
+            <span className="font-mono text-[10px] text-[#9ca3af]">{data.source === "backend" ? "Backend" : "Demo"}</span>
           </div>
         </div>
       </div>

@@ -1,25 +1,66 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { motion } from "framer-motion";
 import { dashboardService, type DashboardData } from "@/services/dashboard.service";
 import { DashboardLayout } from "@/components/dashboard/DashboardLayout";
 import { onboardingStore, type OnboardingState } from "@/lib/onboarding-store";
+import { useHouseholdSocket } from "@/hooks/useHouseholdSocket";
+
+const HH_ID = "hh_xk92p_sharma";
+
+// How long to wait after a live WS event before refreshing dashboard data (ms).
+// Debounced so rapid pipeline events don't flood the backend.
+const REFRESH_DEBOUNCE_MS = 2000;
 
 export default function DashboardPage() {
-  const [data, setData] = useState<DashboardData | null>(null);
+  const [data, setData]           = useState<DashboardData | null>(null);
   const [onboarding, setOnboarding] = useState<OnboardingState | null>(null);
+  const refreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  // ── WebSocket connection ───────────────────────────────────────────────────
+  const { connected, lastEvent } = useHouseholdSocket(HH_ID);
+
+  // ── Initial load ──────────────────────────────────────────────────────────
   useEffect(() => {
-    // Load dashboard data (backend-first, mock fallback)
     dashboardService.load().then(setData);
-
-    // Load onboarding state from localStorage
     const state = onboardingStore.getState();
     setOnboarding(state);
     return onboardingStore.subscribe((s) => setOnboarding(s));
   }, []);
 
+  // ── Live refresh on WebSocket events ──────────────────────────────────────
+  // When the backend broadcasts an action_planned, notification_sent,
+  // command_dispatched, or metrics_update event, refresh dashboard data
+  // so RecentEvents, ReasoningFeed, and LearningProgress update without
+  // the user having to refresh.
+  useEffect(() => {
+    if (!lastEvent) return;
+
+    const triggerTypes = new Set([
+      "action_planned",
+      "command_dispatched",
+      "notification_sent",
+      "metrics_update",
+      "pattern_update",
+    ]);
+
+    if (!triggerTypes.has(lastEvent.type)) return;
+
+    // Debounce — wait until the pipeline settles before fetching fresh data
+    if (refreshTimer.current) clearTimeout(refreshTimer.current);
+    refreshTimer.current = setTimeout(async () => {
+      dashboardService.clearCache();
+      const fresh = await dashboardService.load(true);
+      setData(fresh);
+    }, REFRESH_DEBOUNCE_MS);
+
+    return () => {
+      if (refreshTimer.current) clearTimeout(refreshTimer.current);
+    };
+  }, [lastEvent]);
+
+  // ── Loading skeleton ───────────────────────────────────────────────────────
   if (!data) {
     return (
       <div className="min-h-screen flex flex-col items-center justify-center bg-[#faf7f3] gap-5">
@@ -28,7 +69,6 @@ export default function DashboardPage() {
           initial={{ opacity: 0 }}
           animate={{ opacity: 1 }}
         >
-          {/* Pulsing SAATHI mark */}
           <div className="relative">
             {[0, 1].map((i) => (
               <motion.div
@@ -48,5 +88,11 @@ export default function DashboardPage() {
     );
   }
 
-  return <DashboardLayout data={data} onboardingState={onboarding} />;
+  return (
+    <DashboardLayout
+      data={data}
+      onboardingState={onboarding}
+      wsConnected={connected}
+    />
+  );
 }

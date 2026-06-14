@@ -18,6 +18,14 @@ export interface MockActivity {
   ruleId?: string;
   ruleLabel?: string;
   actionTaken?: string;
+  // Phase 10 — preserved from ActionLog
+  targetMembers?: string[];          // who received the notification
+  deviceId?: string;                 // which device was commanded
+  command?: string;                  // what command was issued
+  channel?: string;                  // delivery channel
+  latencyMs?: number;                // dispatch latency
+  actionType?: "notification" | "device_command" | "reminder";
+  success?: boolean;
 }
 
 export const SHARMA_ACTIVITY: MockActivity[] = [
