@@ -33,6 +33,9 @@ function toWsUrl(base: string, householdId: string): string {
   return base.replace(/^http/, "ws") + `/ws/${householdId}`;
 }
 
+// Max consecutive failures before giving up (avoids infinite retry spam on Lambda)
+const MAX_RETRIES = 3;
+
 // ─── Event shapes ──────────────────────────────────────────────────────────────
 
 export type WSEventType =
@@ -59,11 +62,13 @@ export interface WSMessage {
 export interface SocketState {
   /** True when WebSocket is OPEN */
   connected: boolean;
+  /** True when max retries exceeded — WebSocket not supported by this backend */
+  disabled: boolean;
   /** Most recent message received (null until first message) */
   lastEvent: WSMessage | null;
   /** All events received in this session (last 100) */
   events: WSMessage[];
-  /** Manual reconnect trigger */
+  /** Manual reconnect trigger (also resets the retry counter) */
   reconnect: () => void;
 }
 
@@ -71,15 +76,22 @@ export interface SocketState {
 
 export function useHouseholdSocket(householdId: string): SocketState {
   const [connected, setConnected]   = useState(false);
+  const [disabled, setDisabled]     = useState(false);
   const [lastEvent, setLastEvent]   = useState<WSMessage | null>(null);
   const [events, setEvents]         = useState<WSMessage[]>([]);
-  const wsRef    = useRef<WebSocket | null>(null);
-  const backoff  = useRef(1000);       // ms, doubles on each failure
-  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const wsRef      = useRef<WebSocket | null>(null);
+  const backoff    = useRef(1000);       // ms, doubles on each failure
+  const retries    = useRef(0);          // consecutive failure counter
+  const timerRef   = useRef<ReturnType<typeof setTimeout> | null>(null);
   const mountedRef = useRef(true);
 
   const connect = useCallback(() => {
     if (!mountedRef.current) return;
+    if (retries.current >= MAX_RETRIES) {
+      // Give up — backend doesn't support WebSockets (e.g. Lambda)
+      setDisabled(true);
+      return;
+    }
 
     // Close any existing connection
     if (wsRef.current && wsRef.current.readyState !== WebSocket.CLOSED) {
@@ -99,7 +111,9 @@ export function useHouseholdSocket(householdId: string): SocketState {
     ws.onopen = () => {
       if (!mountedRef.current) return;
       setConnected(true);
+      setDisabled(false);
       backoff.current = 1000; // reset on success
+      retries.current = 0;    // reset failure counter on success
     };
 
     ws.onmessage = (ev) => {
@@ -116,6 +130,14 @@ export function useHouseholdSocket(householdId: string): SocketState {
     ws.onclose = () => {
       if (!mountedRef.current) return;
       setConnected(false);
+      retries.current += 1;
+
+      if (retries.current >= MAX_RETRIES) {
+        // Stop retrying — WebSocket not available on this backend
+        setDisabled(true);
+        return;
+      }
+
       // Reconnect with backoff
       timerRef.current = setTimeout(() => {
         if (mountedRef.current) {
@@ -147,8 +169,10 @@ export function useHouseholdSocket(householdId: string): SocketState {
 
   const reconnect = useCallback(() => {
     backoff.current = 1000;
+    retries.current = 0;   // reset retry counter on manual reconnect
+    setDisabled(false);
     connect();
   }, [connect]);
 
-  return { connected, lastEvent, events, reconnect };
+  return { connected, disabled, lastEvent, events, reconnect };
 }
