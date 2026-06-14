@@ -74,7 +74,7 @@ from services.action_planner import ActionPlanner
 from services.bedrock_layer import BedrockLayer, BedrockCircuitBreaker, ContextBuilder
 from config import settings
 from services.context_engine import ContextEngine
-from db.dynamo_client import health_check, get_table
+from db.dynamo_client import health_check, get_table, async_execute
 from db.seed_dynamo import run_full_seed
 from services.device_command_bus import DeviceCommandBus
 from services.event_batcher import EventBatcher
@@ -466,7 +466,10 @@ async def run_full_pipeline(event: NormalizedEvent) -> dict[str, Any]:
             "estimated_tokens": bedrock_ctx.estimated_tokens,
         })
 
-        bedrock_response = bedrock.invoke(bedrock_ctx, event.household_id)
+        # Bedrock's boto3 call is synchronous and network-bound. Offload it to a
+        # thread so it does not block the asyncio event loop (and therefore other
+        # households' requests / WebSocket fanout) for the duration of the call.
+        bedrock_response = await async_execute(bedrock.invoke, bedrock_ctx, event.household_id)
         bk_latency = (time.monotonic() - bk_start) * 1000
         metrics.record_bedrock(bk_latency, bedrock_response.total_tokens)
         metrics.update_circuit_breaker(circuit_breaker.state)
@@ -1207,28 +1210,29 @@ async def get_action_history(limit: int = 50, household_id: str | None = None):
 # ── RTE Audit ─────────────────────────────────────────────────
 
 @app.get("/rte/audit", tags=["RTE"])
-async def get_rte_audit(limit: int = 30):
+async def get_rte_audit(limit: int = 30, household_id: str | None = None):
     """
     Return recent RTE routing decisions from RTEAuditLog, newest first.
     Used by ReasoningFeed to show actual decision timeline.
     Queries using the household_id-index GSI.
     """
+    hid = household_id or HH_ID
     from boto3.dynamodb.conditions import Key as DKey
     table = get_table("rte_audit_log")
     try:
         resp = table.query(
             IndexName="household_id-index",
-            KeyConditionExpression=DKey("household_id").eq(HH_ID),
+            KeyConditionExpression=DKey("household_id").eq(hid),
             ScanIndexForward=False,
             Limit=limit,
         )
         items = resp.get("Items", [])
         from graph_repository import _decimal_to_native
         decisions = [_decimal_to_native(item) for item in items]
-        return {"household_id": HH_ID, "count": len(decisions), "decisions": decisions}
+        return {"household_id": hid, "count": len(decisions), "decisions": decisions}
     except Exception as e:
         logger.warning(f"RTEAuditLog query failed: {e}")
-        return {"household_id": HH_ID, "count": 0, "decisions": [], "error": str(e)}
+        return {"household_id": hid, "count": 0, "decisions": [], "error": str(e)}
 
 
 # ── RTE Decision (single event, for backward compat with reasoning.service.ts) ──

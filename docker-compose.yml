@@ -1,0 +1,47 @@
+# ──────────────────────────────────────────────────────────────
+# SAATHI — local development stack
+#
+#   docker compose up --build
+#
+# Brings up the backend API together with a Redis instance so
+# distributed state (idempotency, rate limiting, presence,
+# websocket fanout) works out of the box — no manual Redis install.
+#
+# NOTE:
+#   - DynamoDB is NOT containerised. The backend talks to real AWS
+#     DynamoDB using the credentials in backend/.env. The boto3 client
+#     degrades gracefully if credentials are absent.
+#   - The frontend runs on the host via `npm run dev` (fast hot reload).
+#     A production frontend image is defined in frontend/Dockerfile.
+# ──────────────────────────────────────────────────────────────
+
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  backend:
+    build:
+      context: ./backend
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    # AWS creds + table names + Bedrock settings come from backend/.env
+    env_file:
+      - ./backend/.env
+    # Override Redis settings to point at the compose service instead of localhost
+    environment:
+      REDIS_ENABLED: "true"
+      REDIS_URL: "redis://redis:6379/0"
+    depends_on:
+      redis:
+        condition: service_healthy
+
+volumes: {}

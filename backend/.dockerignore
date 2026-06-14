@@ -1,0 +1,16 @@
+# Virtualenvs / local Python state
+.venv/
+venv/
+__pycache__/
+**/__pycache__/
+*.pyc
+.pytest_cache/
+
+# Secrets — never bake into an image (provide via env_file / runtime env)
+.env
+
+# Local tooling
+.vscode/
+.git/
+*.md
+tests/
