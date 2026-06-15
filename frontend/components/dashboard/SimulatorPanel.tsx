@@ -5,7 +5,7 @@ import { motion, AnimatePresence } from "framer-motion";
 import { X, Play, Database, Send, AlertCircle } from "lucide-react";
 import type { DashboardData } from "@/services/dashboard.service";
 import { Button } from "@/components/ui/Button";
-import { BACKEND_BASE } from "@/services/api.config";
+import { BACKEND_BASE, SIMULATE_TIMEOUT_MS } from "@/services/api.config";
 import { useDashboard } from "@/components/dashboard/DashboardProvider";
 
 interface SimulatorPanelProps {
@@ -43,16 +43,31 @@ export function SimulatorPanel({ isOpen, onClose, data }: SimulatorPanelProps) {
     setLoading(true);
     setResult(null);
     try {
-      const res = await fetch(`${BACKEND_BASE}/simulate/event/${eventName}?household_id=${data.household.id}`, {
-        method: "POST",
-      });
-      if (res.ok) {
-        await refresh();
-        setResult({ status: "success", msg: `Event '${eventName}' simulated successfully.` });
-      } else {
-        setResult({ status: "error", msg: `Failed to simulate event: ${await res.text()}` });
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), SIMULATE_TIMEOUT_MS);
+      try {
+        const res = await fetch(`${BACKEND_BASE}/simulate/event/${eventName}?household_id=${data.household.id}`, {
+          method: "POST",
+          signal: ctrl.signal,
+        });
+        clearTimeout(timer);
+        if (res.ok) {
+          setResult({ status: "success", msg: `Event '${eventName}' simulated successfully. Refreshing data…` });
+          // Wait 2s for async audit log writes to complete in Lambda, then refresh
+          await new Promise(r => setTimeout(r, 2000));
+          await refresh();
+        } else {
+          setResult({ status: "error", msg: `Failed to simulate event: ${await res.text()}` });
+        }
+      } catch (e: unknown) {
+        clearTimeout(timer);
+        if (e instanceof DOMException && e.name === 'AbortError') {
+          setResult({ status: "error", msg: "Request timed out — Lambda may still be processing." });
+        } else {
+          setResult({ status: "error", msg: "Backend unreachable." });
+        }
       }
-    } catch (e) {
+    } catch {
       setResult({ status: "error", msg: "Backend unreachable." });
     }
     setLoading(false);
@@ -71,6 +86,8 @@ export function SimulatorPanel({ isOpen, onClose, data }: SimulatorPanelProps) {
         return;
       }
 
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), SIMULATE_TIMEOUT_MS);
       const res = await fetch(`${BACKEND_BASE}/events/ingest`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -79,11 +96,14 @@ export function SimulatorPanel({ isOpen, onClose, data }: SimulatorPanelProps) {
           source: "SIMULATOR",
           payload: parsed,
         }),
+        signal: ctrl.signal,
       });
+      clearTimeout(timer);
 
       if (res.ok) {
+        setResult({ status: "success", msg: "Event ingested successfully. Refreshing data…" });
+        await new Promise(r => setTimeout(r, 2000));
         await refresh();
-        setResult({ status: "success", msg: "Event ingested successfully." });
       } else {
         setResult({ status: "error", msg: `Ingest failed: ${await res.text()}` });
       }
@@ -97,10 +117,14 @@ export function SimulatorPanel({ isOpen, onClose, data }: SimulatorPanelProps) {
     setLoading(true);
     setResult(null);
     try {
-      const res = await fetch(`${BACKEND_BASE}/admin/seed`, { method: "POST" });
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), SIMULATE_TIMEOUT_MS);
+      const res = await fetch(`${BACKEND_BASE}/admin/seed`, { method: "POST", signal: ctrl.signal });
+      clearTimeout(timer);
       if (res.ok) {
+        setResult({ status: "success", msg: "Database seeded successfully. Refreshing data…" });
+        await new Promise(r => setTimeout(r, 2000));
         await refresh();
-        setResult({ status: "success", msg: "Database seeded successfully." });
       } else {
         setResult({ status: "error", msg: `Seed failed: ${await res.text()}` });
       }
