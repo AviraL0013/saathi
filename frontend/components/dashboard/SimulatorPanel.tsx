@@ -6,6 +6,7 @@ import { X, Play, Database, Send, AlertCircle } from "lucide-react";
 import type { DashboardData } from "@/services/dashboard.service";
 import { Button } from "@/components/ui/Button";
 import { BACKEND_BASE } from "@/services/api.config";
+import { useDashboard } from "@/components/dashboard/DashboardProvider";
 
 interface SimulatorPanelProps {
   isOpen: boolean;
@@ -14,6 +15,7 @@ interface SimulatorPanelProps {
 }
 
 export function SimulatorPanel({ isOpen, onClose, data }: SimulatorPanelProps) {
+  const { refresh } = useDashboard();
   const [ingestPayload, setIngestPayload] = useState('{\n  "event_type": "sensor_reading",\n  "device_id": "sensor_01",\n  "value": 25\n}');
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState<{ status: "success" | "error"; msg: string } | null>(null);
@@ -45,6 +47,7 @@ export function SimulatorPanel({ isOpen, onClose, data }: SimulatorPanelProps) {
         method: "POST",
       });
       if (res.ok) {
+        await refresh();
         setResult({ status: "success", msg: `Event '${eventName}' simulated successfully.` });
       } else {
         setResult({ status: "error", msg: `Failed to simulate event: ${await res.text()}` });
@@ -79,6 +82,7 @@ export function SimulatorPanel({ isOpen, onClose, data }: SimulatorPanelProps) {
       });
 
       if (res.ok) {
+        await refresh();
         setResult({ status: "success", msg: "Event ingested successfully." });
       } else {
         setResult({ status: "error", msg: `Ingest failed: ${await res.text()}` });
@@ -95,6 +99,7 @@ export function SimulatorPanel({ isOpen, onClose, data }: SimulatorPanelProps) {
     try {
       const res = await fetch(`${BACKEND_BASE}/admin/seed`, { method: "POST" });
       if (res.ok) {
+        await refresh();
         setResult({ status: "success", msg: "Database seeded successfully." });
       } else {
         setResult({ status: "error", msg: `Seed failed: ${await res.text()}` });
