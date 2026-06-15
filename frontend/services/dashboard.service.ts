@@ -1570,6 +1570,20 @@ export const dashboardService = {
         .map((n) => graphNodeToMockDevice(n, fullGraph));
     }
 
+    if (deviceList.length === 0 && onboardingState?.devices) {
+      deviceList = onboardingState.devices.map(d => ({
+        id: d.id,
+        name: d.name,
+        type: normalizeDeviceType(d.type),
+        room: formatRoomLabel(d.room),
+        emoji: deviceEmoji(d.type),
+        status: "standby",
+        primaryUser: "unknown",
+        primaryUserName: "Unknown",
+        lastActivity: "Recently added via onboarding"
+      }));
+    }
+
     // HouseholdMemory — DERIVED from /patterns + /metrics
     const memory: HouseholdMemory =
       patterns && metrics
