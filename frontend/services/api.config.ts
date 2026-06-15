@@ -12,8 +12,11 @@ export const BACKEND_BASE =
 /** Default household used in the demo / Sharma family seed */
 export const DEFAULT_HOUSEHOLD_ID = "hh_xk92p_sharma";
 
-/** Timeout for all discovery probes */
-export const PROBE_TIMEOUT_MS = 3000;
+/** Timeout for all discovery probes (15s to accommodate Lambda cold starts) */
+export const PROBE_TIMEOUT_MS = 15000;
+
+/** Timeout for simulate/ingest calls (pipeline can take 10-20s on Lambda) */
+export const SIMULATE_TIMEOUT_MS = 30000;
 
 // ─── Named demo events the backend supports ───────────────────────────────────
 export const NAMED_EVENTS = [
