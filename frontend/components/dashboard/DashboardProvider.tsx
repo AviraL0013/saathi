@@ -15,12 +15,14 @@ interface DashboardContextType {
   data: DashboardData | null;
   onboardingState: OnboardingState | null;
   wsConnected: boolean;
+  refresh: () => Promise<void>;
 }
 
 const DashboardContext = createContext<DashboardContextType>({
   data: null,
   onboardingState: null,
   wsConnected: false,
+  refresh: async () => {},
 });
 
 export function useDashboard() {
@@ -40,6 +42,12 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
   const [onboarding, setOnboarding] = useState<OnboardingState | null>(null);
   const [hhId, setHhId] = useState<string>(HH_ID);
   const refreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const refresh = async () => {
+    dashboardService.clearCache();
+    const fresh = await dashboardService.load(hhId, true, onboardingStore.getState());
+    setData(fresh);
+  };
 
   const { connected, lastEvent } = useHouseholdSocket(hhId);
   const pathname = usePathname();
@@ -119,7 +127,7 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
   }
 
   return (
-    <DashboardContext.Provider value={{ data, onboardingState: onboarding, wsConnected: connected }}>
+    <DashboardContext.Provider value={{ data, onboardingState: onboarding, wsConnected: connected, refresh }}>
       <div className="min-h-screen bg-[#faf7f3] flex flex-col">
         <DashboardHeader data={data} wsConnected={connected} />
         
