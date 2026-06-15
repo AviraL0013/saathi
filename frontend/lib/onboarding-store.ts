@@ -27,13 +27,13 @@ export type Device = {
   name: string;
   type:
     | "ac"
-    | "tv"
+    | "television"
     | "water_motor"
     | "geyser"
-    | "fridge"
+    | "smart_fridge"
     | "washing_machine"
     | "pressure_cooker"
-    | "lights"
+    | "light"
     | "security_camera"
     | "doorbell"
     | "other";
